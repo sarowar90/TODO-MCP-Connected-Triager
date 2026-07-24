@@ -67,13 +67,27 @@ class TriageService {
     required MessagesApi api,
     required ToolExecutor executor,
     int maxIterations = 6,
+    List<Map<String, dynamic>> mcpServers = const [],
+    List<Map<String, dynamic>> mcpToolsets = const [],
+    String? mcpGuidance,
   })  : _api = api,
         _executor = executor,
-        _maxIterations = maxIterations;
+        _maxIterations = maxIterations,
+        _mcpServers = mcpServers,
+        _mcpToolsets = mcpToolsets,
+        _mcpGuidance = mcpGuidance;
 
   final MessagesApi _api;
   final ToolExecutor _executor;
   final int _maxIterations;
+
+  /// MCP connector config (e.g. the GitHub server). When [_mcpServers] is
+  /// non-empty, Claude can call the [_mcpToolsets]' tools server-side and
+  /// [_mcpGuidance] tells it when to; empty by default, so triage is unchanged
+  /// unless a connector is wired in.
+  final List<Map<String, dynamic>> _mcpServers;
+  final List<Map<String, dynamic>> _mcpToolsets;
+  final String? _mcpGuidance;
 
   /// Triage a single support message: run the cheap tier, and re-run on the
   /// capable tier if [ModelPolicy.shouldEscalate] flags the result.
@@ -127,8 +141,13 @@ class TriageService {
     final tools = <Map<String, dynamic>>[
       ...triageTools(),
       if (withWebSearch) webSearchTool(),
+      ..._mcpToolsets,
     ];
-    final system = buildTriageSystemPrompt(withWebSearch: withWebSearch);
+    final mcpServers = _mcpServers.isEmpty ? null : _mcpServers;
+    final system = buildTriageSystemPrompt(
+      withWebSearch: withWebSearch,
+      extraGuidance: _mcpGuidance,
+    );
     final messages = <Map<String, dynamic>>[
       {'role': 'user', 'content': supportMessage},
     ];
@@ -148,6 +167,7 @@ class TriageService {
               messages: messages,
               tools: tools,
               toolChoice: toolChoice,
+              mcpServers: mcpServers,
               onTextDelta: onTextDelta,
               onToolUseStart: onToolUseStart,
             )
@@ -158,10 +178,16 @@ class TriageService {
               messages: messages,
               tools: tools,
               toolChoice: toolChoice,
+              mcpServers: mcpServers,
             );
 
       final content = (response['content'] as List).cast<Map<String, dynamic>>();
       messages.add({'role': 'assistant', 'content': content});
+
+      // Record any MCP (server-executed) tool calls — e.g. GitHub issue
+      // lookup/creation — in the trace, pairing each mcp_tool_use with its
+      // mcp_tool_result so the outcome captures what happened on GitHub.
+      _recordMcpCalls(content, trace);
 
       final toolUses =
           content.where((b) => b['type'] == 'tool_use').toList();
@@ -263,6 +289,44 @@ class TriageService {
     );
   }
 
+  /// Appends any MCP tool calls in [content] to [trace]. MCP tools run
+  /// server-side, so each `mcp_tool_use` is paired with its `mcp_tool_result`
+  /// (matched by id) within the same response — we don't execute anything, just
+  /// record what the model did on the remote server for the audit trail.
+  static void _recordMcpCalls(
+    List<Map<String, dynamic>> content,
+    List<ToolCall> trace,
+  ) {
+    final resultsById = {
+      for (final b in content)
+        if (b['type'] == 'mcp_tool_result') b['tool_use_id'] as String: b,
+    };
+    for (final b in content) {
+      if (b['type'] != 'mcp_tool_use') continue;
+      final result = resultsById[b['id'] as String];
+      trace.add(ToolCall(
+        name: '${b['server_name'] ?? 'mcp'}/${b['name']}',
+        input: (b['input'] as Map?)?.cast<String, dynamic>() ?? const {},
+        resultContent: _mcpResultText(result),
+        isError: result?['is_error'] == true,
+      ));
+    }
+  }
+
+  /// Joins the text blocks of an `mcp_tool_result` into a single string.
+  static String _mcpResultText(Map<String, dynamic>? result) {
+    final content = result?['content'];
+    if (content is String) return content;
+    if (content is List) {
+      return content
+          .whereType<Map>()
+          .where((b) => b['type'] == 'text')
+          .map((b) => b['text'] as String? ?? '')
+          .join();
+    }
+    return '';
+  }
+
   static String? _extractTicketId(String toolResultContent) {
     try {
       final decoded = jsonDecode(toolResultContent) as Map<String, dynamic>;
@@ -276,7 +340,10 @@ class TriageService {
 /// Builds the system prompt from the triage rules. The allowed values are
 /// pulled from the taxonomy enums so the prompt can't drift out of sync with
 /// the code; the precedence rules mirror `triage_spec.md`.
-String buildTriageSystemPrompt({bool withWebSearch = false}) {
+String buildTriageSystemPrompt({
+  bool withWebSearch = false,
+  String? extraGuidance,
+}) {
   String wire<T extends Enum>(List<T> values) =>
       values.map((v) => (v as dynamic).wireName as String).join(', ');
 
@@ -334,5 +401,5 @@ it sets, and later rules still fill fields an earlier rule left unset:
 Confidence: report your certainty from 0.0 to 1.0. If the message is unclear, you
 cannot confidently pick a topic, or your confidence is below 0.60, set
 needs_human_review = true and team = triage_review.
-$webSearchGuidance''';
+$webSearchGuidance${extraGuidance ?? ''}''';
 }

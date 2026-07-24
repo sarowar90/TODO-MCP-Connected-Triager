@@ -6,6 +6,7 @@ import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 
 import 'package:todo_app/triage/anthropic_client.dart';
+import 'package:todo_app/triage/github_mcp.dart';
 import 'package:todo_app/triage/model_policy.dart';
 import 'package:todo_app/triage/tools.dart';
 import 'package:todo_app/triage/triage_service.dart';
@@ -30,6 +31,7 @@ class FakeMessagesApi extends MessagesApi {
     required List<Map<String, dynamic>> messages,
     List<Map<String, dynamic>>? tools,
     Map<String, dynamic>? toolChoice,
+    List<Map<String, dynamic>>? mcpServers,
   }) async {
     // Snapshot the messages list — the service keeps mutating the same
     // instance across the loop, so store a copy to inspect per-request state.
@@ -38,6 +40,7 @@ class FakeMessagesApi extends MessagesApi {
       'messages': List<Map<String, dynamic>>.from(messages),
       'tool_choice': toolChoice,
       'tools': tools,
+      'mcp_servers': mcpServers,
     });
     if (_index >= responses.length) {
       throw StateError('FakeMessagesApi ran out of scripted responses.');
@@ -84,6 +87,29 @@ Map<String, dynamic> assistantPauseTurn(List<Map<String, dynamic>> blocks) =>
 Map<String, dynamic> serverToolUse(
         String id, String name, Map<String, dynamic> input) =>
     {'type': 'server_tool_use', 'id': id, 'name': name, 'input': input};
+
+/// A GitHub MCP tool invocation the server executed, and its result — the shape
+/// the MCP connector returns in the response content.
+Map<String, dynamic> mcpToolUse(
+        String id, String name, Map<String, dynamic> input) =>
+    {
+      'type': 'mcp_tool_use',
+      'id': id,
+      'name': name,
+      'server_name': 'github',
+      'input': input,
+    };
+
+Map<String, dynamic> mcpToolResult(String toolUseId, String text,
+        {bool isError = false}) =>
+    {
+      'type': 'mcp_tool_result',
+      'tool_use_id': toolUseId,
+      'is_error': isError,
+      'content': [
+        {'type': 'text', 'text': text},
+      ],
+    };
 
 Map<String, dynamic> assistantTextTurn(String text) => {
       'stop_reason': 'end_turn',
@@ -215,6 +241,24 @@ void main() {
       // Fenced to specific sources so it can't roam the open web.
       expect(ws['allowed_domains'], isNotEmpty);
       expect(ws['max_uses'], isNotNull);
+    });
+
+    test('github MCP server + toolset are well-formed and name-matched', () {
+      final server = githubMcpServer(authorizationToken: 'ghp_x');
+      expect(server['type'], 'url');
+      expect(server['url'], githubMcpUrl);
+      expect(server['authorization_token'], 'ghp_x');
+
+      final toolset = githubIssueToolset();
+      expect(toolset['type'], 'mcp_toolset');
+      // The toolset must reference the server by the same name, or the API 400s.
+      expect(toolset['mcp_server_name'], server['name']);
+      // Allowlisted: default off, issue tools explicitly enabled.
+      expect((toolset['default_config'] as Map)['enabled'], isFalse);
+      final enabled = (toolset['configs'] as List)
+          .where((c) => c['enabled'] == true)
+          .map((c) => c['name']);
+      expect(enabled, containsAll(['search_issues', 'create_issue']));
     });
   });
 
@@ -382,6 +426,71 @@ void main() {
       final resendMessages =
           api.requests[1]['messages'] as List<Map<String, dynamic>>;
       expect(resendMessages.last['role'], 'assistant');
+    });
+
+    test('files a GitHub issue via MCP and captures it in the outcome',
+        () async {
+      // End-to-end (network scripted): Claude searches existing issues, finds
+      // none, creates one via the GitHub MCP server, then routes the ticket.
+      const repo = 'sarowar90/TODO-MCP-Connected-Triager';
+      const issueUrl =
+          'https://github.com/$repo/issues/42';
+      final api = FakeMessagesApi([
+        // Turn 1 — MCP: search (no match) then create_issue. Server-executed,
+        // so it comes back in one turn and the server pauses (pause_turn).
+        assistantPauseTurn([
+          {'type': 'text', 'text': 'Checking for a duplicate issue.'},
+          mcpToolUse('m1', 'search_issues', {'query': 'CSV export 500'}),
+          mcpToolResult('m1', '{"total_count":0,"items":[]}'),
+          mcpToolUse('m2', 'create_issue', {
+            'owner': 'sarowar90',
+            'repo': 'TODO-MCP-Connected-Triager',
+            'title': 'CSV export returns 500',
+            'body': 'Export button 500s from /api/reports/export.',
+          }),
+          mcpToolResult('m2',
+              '{"number":42,"html_url":"$issueUrl","state":"open"}'),
+        ]),
+        // Turn 2 — route the ticket, referencing the new issue.
+        assistantToolTurn([
+          toolUse('t', 'create_ticket',
+              ticketInput(topic: 'technical', team: 'engineering')),
+        ]),
+      ]);
+      final service = TriageService(
+        api: api,
+        executor: MockToolExecutor(),
+        mcpServers: [githubMcpServer(authorizationToken: 'ghp_x')],
+        mcpToolsets: [githubIssueToolset()],
+        mcpGuidance: githubIssueGuidance(repo),
+      );
+
+      final outcome =
+          await service.triage('CSV export button 500s, blocks reporting');
+
+      // The GitHub MCP calls were recorded in the trace, results and all.
+      final names = outcome.toolCalls.map((c) => c.name).toList();
+      expect(names, containsAll(['github/search_issues', 'github/create_issue']));
+      final createCall =
+          outcome.toolCalls.firstWhere((c) => c.name == 'github/create_issue');
+      // The captured end-to-end result: the created issue.
+      expect(createCall.resultContent, contains(issueUrl));
+      expect(createCall.input['title'], 'CSV export returns 500');
+      expect(createCall.isError, isFalse);
+
+      // A ticket was still routed after the issue was filed.
+      expect(outcome.ticketId, startsWith('TICK-'));
+
+      // The request actually carried the MCP connector: server + toolset.
+      expect(api.requests.first['mcp_servers'], isNotNull);
+      expect(
+          (api.requests.first['mcp_servers'] as List).first['name'], 'github');
+      expect(
+          (api.requests.first['tools'] as List)
+              .any((t) => t['type'] == 'mcp_toolset'),
+          isTrue);
+      // Resumed past pause_turn rather than forcing the ticket.
+      expect(api.requests[1]['tool_choice'], {'type': 'auto'});
     });
 
     test('runs independent tools in parallel, combining results into one turn',
@@ -637,6 +746,69 @@ void main() {
       expect(narration.toString(), 'Checking the account first.');
       expect(toolsStarted, contains('create_ticket'));
       expect(outcome.ticketId, isNotNull);
+    });
+  });
+
+  group('MCP connector (wire format)', () {
+    test('createMessage sends mcp_servers and the beta header', () async {
+      late http.Request captured;
+      final mock = MockClient((request) async {
+        captured = request;
+        return http.Response(
+          jsonEncode({
+            'content': [
+              {'type': 'text', 'text': 'ok'}
+            ],
+            'stop_reason': 'end_turn',
+          }),
+          200,
+          headers: {'content-type': 'application/json'},
+        );
+      });
+      final client = AnthropicClient(apiKey: 'k', httpClient: mock);
+
+      await client.createMessage(
+        model: 'claude-opus-4-8',
+        maxTokens: 100,
+        messages: [{'role': 'user', 'content': 'hi'}],
+        tools: [githubIssueToolset()],
+        mcpServers: [githubMcpServer(authorizationToken: 'ghp_x')],
+      );
+
+      // Beta opt-in only appears when the connector is used.
+      expect(captured.headers['anthropic-beta'], 'mcp-client-2025-11-20');
+      final body = jsonDecode(captured.body) as Map<String, dynamic>;
+      expect((body['mcp_servers'] as List).first['url'], githubMcpUrl);
+    });
+
+    test('omits mcp_servers and the beta header when none configured', () async {
+      late http.Request captured;
+      final mock = MockClient((request) async {
+        captured = request;
+        return http.Response(
+          jsonEncode({'content': <dynamic>[], 'stop_reason': 'end_turn'}),
+          200,
+        );
+      });
+      final client = AnthropicClient(apiKey: 'k', httpClient: mock);
+
+      await client.createMessage(
+        model: 'claude-haiku-4-5',
+        maxTokens: 100,
+        messages: [{'role': 'user', 'content': 'hi'}],
+      );
+
+      expect(captured.headers.containsKey('anthropic-beta'), isFalse);
+      expect((jsonDecode(captured.body) as Map).containsKey('mcp_servers'),
+          isFalse);
+    });
+
+    test('github guidance is threaded into the system prompt', () {
+      final prompt = buildTriageSystemPrompt(
+        extraGuidance: githubIssueGuidance('acme/support'),
+      );
+      expect(prompt, contains('acme/support'));
+      expect(prompt, contains('github tools'));
     });
   });
 }

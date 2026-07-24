@@ -24,6 +24,7 @@ abstract class MessagesApi {
     required List<Map<String, dynamic>> messages,
     List<Map<String, dynamic>>? tools,
     Map<String, dynamic>? toolChoice,
+    List<Map<String, dynamic>>? mcpServers,
   });
 
   /// Streaming variant: returns the same result as [createMessage] but invokes
@@ -37,6 +38,7 @@ abstract class MessagesApi {
     required List<Map<String, dynamic>> messages,
     List<Map<String, dynamic>>? tools,
     Map<String, dynamic>? toolChoice,
+    List<Map<String, dynamic>>? mcpServers,
     void Function(String textDelta)? onTextDelta,
     void Function(String toolName)? onToolUseStart,
   }) async {
@@ -47,6 +49,7 @@ abstract class MessagesApi {
       messages: messages,
       tools: tools,
       toolChoice: toolChoice,
+      mcpServers: mcpServers,
     );
     final content =
         (response['content'] as List?)?.cast<Map<String, dynamic>>() ?? const [];
@@ -83,11 +86,21 @@ class AnthropicClient extends MessagesApi {
   static const _url = 'https://api.anthropic.com/v1/messages';
   static const _apiVersion = '2023-06-01';
 
+  /// Opt-in beta for the MCP connector — lets Claude call a remote MCP server's
+  /// tools (e.g. GitHub) server-side. Only sent when [mcpServers] is supplied.
+  static const _mcpBeta = 'mcp-client-2025-11-20';
+
   Map<String, String> get _headers => {
         'content-type': 'application/json',
         'x-api-key': apiKey,
         'anthropic-version': _apiVersion,
       };
+
+  /// Adds the MCP-connector beta header when the request uses MCP servers.
+  Map<String, String> _headersFor(List<Map<String, dynamic>>? mcpServers) {
+    if (mcpServers == null || mcpServers.isEmpty) return _headers;
+    return {..._headers, 'anthropic-beta': _mcpBeta};
+  }
 
   /// Wraps the (stable) system prompt in a cached text block. `tools` and
   /// `system` render before `messages`, so one `cache_control` breakpoint on the
@@ -116,10 +129,12 @@ class AnthropicClient extends MessagesApi {
     required List<Map<String, dynamic>> messages,
     List<Map<String, dynamic>>? tools,
     Map<String, dynamic>? toolChoice,
+    List<Map<String, dynamic>>? mcpServers,
   }) async {
+    final mcp = (mcpServers?.isNotEmpty ?? false) ? mcpServers : null;
     final response = await _http.post(
       Uri.parse(_url),
-      headers: _headers,
+      headers: _headersFor(mcp),
       body: jsonEncode({
         'model': model,
         'max_tokens': maxTokens,
@@ -127,6 +142,7 @@ class AnthropicClient extends MessagesApi {
         'system': ?_systemBlocks(system),
         'tools': ?tools,
         'tool_choice': ?toolChoice,
+        'mcp_servers': ?mcp,
       }),
     );
 
@@ -145,11 +161,13 @@ class AnthropicClient extends MessagesApi {
     required List<Map<String, dynamic>> messages,
     List<Map<String, dynamic>>? tools,
     Map<String, dynamic>? toolChoice,
+    List<Map<String, dynamic>>? mcpServers,
     void Function(String textDelta)? onTextDelta,
     void Function(String toolName)? onToolUseStart,
   }) async {
+    final mcp = (mcpServers?.isNotEmpty ?? false) ? mcpServers : null;
     final request = http.Request('POST', Uri.parse(_url))
-      ..headers.addAll(_headers)
+      ..headers.addAll(_headersFor(mcp))
       ..body = jsonEncode({
         'model': model,
         'max_tokens': maxTokens,
@@ -158,6 +176,7 @@ class AnthropicClient extends MessagesApi {
         'system': ?_systemBlocks(system),
         'tools': ?tools,
         'tool_choice': ?toolChoice,
+        'mcp_servers': ?mcp,
       });
 
     final streamed = await _http.send(request);
