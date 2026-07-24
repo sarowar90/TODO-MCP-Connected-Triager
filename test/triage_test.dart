@@ -8,6 +8,8 @@ import 'package:http/testing.dart';
 import 'package:todo_app/triage/anthropic_client.dart';
 import 'package:todo_app/triage/github_mcp.dart';
 import 'package:todo_app/triage/model_policy.dart';
+import 'package:todo_app/triage/slack_mcp.dart';
+import 'package:todo_app/triage/slack_router.dart';
 import 'package:todo_app/triage/tools.dart';
 import 'package:todo_app/triage/triage_service.dart';
 import 'package:todo_app/triage/triage_taxonomy.dart';
@@ -137,6 +139,49 @@ Map<String, dynamic> ticketInput({
       'needs_human_review': needsReview,
       'customer_id': customerId,
       'order_id': orderId,
+    };
+
+/// A completed triage outcome for a given team — feeds the Slack router tests.
+TriageOutcome outcomeFor(Team team, {String ticketId = 'TICK-5000'}) =>
+    TriageOutcome(
+      result: TriageResult(
+        urgency: Urgency.high,
+        topic: Topic.complaint,
+        team: team,
+        summary: 'Customer is threatening to cancel over repeat billing errors.',
+        rationale: 'Cancellation threat -> retention, urgency high.',
+        confidence: 0.9,
+        needsHumanReview: false,
+      ),
+      tierUsed: ModelTier.fastClassifier,
+      escalated: false,
+      toolCalls: const [],
+      ticketId: ticketId,
+    );
+
+/// A Slack post the connector executed server-side, plus its result.
+Map<String, dynamic> slackPostTurn(String channel, String resultJson,
+        {bool isError = false}) =>
+    {
+      'stop_reason': 'end_turn',
+      'content': [
+        {'type': 'text', 'text': 'Posting the notification.'},
+        {
+          'type': 'mcp_tool_use',
+          'id': 's1',
+          'name': 'slack_post_message',
+          'server_name': 'slack',
+          'input': {'channel': channel, 'text': 'triage notification'},
+        },
+        {
+          'type': 'mcp_tool_result',
+          'tool_use_id': 's1',
+          'is_error': isError,
+          'content': [
+            {'type': 'text', 'text': resultJson},
+          ],
+        },
+      ],
     };
 
 // --- SSE helpers for the streaming tests ---
@@ -809,6 +854,94 @@ void main() {
       );
       expect(prompt, contains('acme/support'));
       expect(prompt, contains('github tools'));
+    });
+  });
+
+  group('Slack routing', () {
+    test('resolves a channel for every team, with override + fallback', () {
+      // Total over the taxonomy — routing always has a destination.
+      for (final t in Team.values) {
+        expect(slackChannelFor(t), isNotEmpty);
+      }
+      expect(slackChannelFor(Team.retention), '#cx-retention');
+      expect(slackChannelFor(Team.trustAndSafety), '#security-escalations');
+      // Custom map wins; a team the custom map omits falls back to triage.
+      expect(slackChannelFor(Team.billing, {Team.billing: '#money'}), '#money');
+      expect(
+          slackChannelFor(Team.engineering, {Team.triageReview: '#tri'}),
+          '#tri');
+    });
+
+    test('slack MCP server + toolset are well-formed and name-matched', () {
+      final server = slackMcpServer(authorizationToken: 'xoxb-x');
+      expect(server['type'], 'url');
+      expect(server['url'], slackMcpUrl);
+      expect(server['authorization_token'], 'xoxb-x');
+
+      final toolset = slackToolset();
+      expect(toolset['type'], 'mcp_toolset');
+      expect(toolset['mcp_server_name'], server['name']);
+      expect((toolset['default_config'] as Map)['enabled'], isFalse);
+      expect((toolset['configs'] as List).map((c) => c['name']),
+          contains('slack_post_message'));
+    });
+
+    test('routes a churn outcome to the correct channel via Slack MCP',
+        () async {
+      // The router picks #cx-retention from the team; the model posts there.
+      final api = FakeMessagesApi([
+        slackPostTurn('#cx-retention', '{"ok":true,"ts":"1700.0001"}'),
+      ]);
+      final router = SlackRouter(api: api, authorizationToken: 'xoxb-x');
+
+      final delivery = await router.route(outcomeFor(Team.retention));
+
+      expect(delivery.posted, isTrue);
+      expect(delivery.channel, '#cx-retention');
+      expect(delivery.reachedCorrectDestination, isTrue);
+      expect(delivery.resultContent, contains('"ok":true'));
+
+      // The request actually carried the Slack connector...
+      expect((api.requests.first['mcp_servers'] as List).first['name'], 'slack');
+      // ...and the instruction named the deterministic channel, not a guess.
+      final firstUserMsg = (api.requests.first['messages'] as List).first;
+      expect(firstUserMsg['content'].toString(), contains('#cx-retention'));
+    });
+
+    test('flags a post that landed in the wrong channel', () async {
+      // Model posts somewhere other than the routed channel — the delivery
+      // records posted:true but reachedCorrectDestination:false.
+      final api = FakeMessagesApi([
+        slackPostTurn('#random-chatter', '{"ok":true,"ts":"1700.0002"}'),
+      ]);
+      final router = SlackRouter(api: api, authorizationToken: 'xoxb-x');
+
+      final delivery = await router.route(outcomeFor(Team.retention));
+
+      expect(delivery.posted, isTrue);
+      expect(delivery.channel, '#cx-retention');
+      expect(delivery.toolInput['channel'], '#random-chatter');
+      expect(delivery.reachedCorrectDestination, isFalse);
+    });
+
+    test('resumes past pause_turn before the post lands', () async {
+      final api = FakeMessagesApi([
+        // Server tool paused mid-work, no post yet.
+        {
+          'stop_reason': 'pause_turn',
+          'content': [
+            {'type': 'text', 'text': 'Looking up the channel.'},
+          ],
+        },
+        slackPostTurn('#security-escalations', '{"ok":true,"ts":"1700.0003"}'),
+      ]);
+      final router = SlackRouter(api: api, authorizationToken: 'xoxb-x');
+
+      final delivery = await router.route(outcomeFor(Team.trustAndSafety));
+
+      expect(delivery.reachedCorrectDestination, isTrue);
+      expect(delivery.channel, '#security-escalations');
+      expect(api.requests, hasLength(2));
     });
   });
 }
