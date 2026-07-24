@@ -8,6 +8,7 @@ import 'package:http/testing.dart';
 import 'package:todo_app/triage/anthropic_client.dart';
 import 'package:todo_app/triage/github_mcp.dart';
 import 'package:todo_app/triage/model_policy.dart';
+import 'package:todo_app/triage/sla_policy.dart';
 import 'package:todo_app/triage/slack_mcp.dart';
 import 'package:todo_app/triage/slack_router.dart';
 import 'package:todo_app/triage/tools.dart';
@@ -854,6 +855,40 @@ void main() {
       );
       expect(prompt, contains('acme/support'));
       expect(prompt, contains('github tools'));
+    });
+  });
+
+  group('custom MCP tool (SLA policy)', () {
+    test('resolves a policy for every urgency, keyed to the taxonomy', () {
+      for (final u in Urgency.values) {
+        final policy = slaPolicyFor(u.wireName);
+        expect(policy['urgency'], u.wireName);
+        expect(policy['first_response_target'], u.slaTarget);
+        expect(policy['pages_on_call'], isA<bool>());
+        expect(policy['escalation'], isNotEmpty);
+      }
+    });
+
+    test('only urgent pages on-call', () {
+      expect(slaPolicyFor('urgent')['pages_on_call'], isTrue);
+      for (final u in ['high', 'normal', 'low']) {
+        expect(slaPolicyFor(u)['pages_on_call'], isFalse);
+      }
+    });
+
+    test('throws on an off-taxonomy urgency', () {
+      expect(() => slaPolicyFor('catastrophic'), throwsArgumentError);
+    });
+
+    test('tool schema is MCP-shaped and enum matches Urgency', () {
+      final schema = slaPolicyToolSchema();
+      expect(schema['name'], 'get_sla_policy');
+      // MCP uses inputSchema (camelCase), not the Messages API's input_schema.
+      expect(schema.containsKey('inputSchema'), isTrue);
+      final props = (schema['inputSchema'] as Map)['properties'] as Map;
+      expect((props['urgency'] as Map)['enum'],
+          Urgency.values.map((u) => u.wireName).toList());
+      expect((schema['inputSchema'] as Map)['additionalProperties'], isFalse);
     });
   });
 

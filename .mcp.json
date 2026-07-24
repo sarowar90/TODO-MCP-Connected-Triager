@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "support-sla": {
+      "type": "stdio",
+      "command": "dart",
+      "args": ["run", "bin/sla_mcp_server.dart"]
+    }
+  }
+}
