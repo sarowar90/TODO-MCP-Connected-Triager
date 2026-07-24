@@ -89,6 +89,25 @@ class AnthropicClient extends MessagesApi {
         'anthropic-version': _apiVersion,
       };
 
+  /// Wraps the (stable) system prompt in a cached text block. `tools` and
+  /// `system` render before `messages`, so one `cache_control` breakpoint on the
+  /// system block caches the whole tools+system prefix together — it's byte-for-
+  /// byte identical across every tool-loop iteration, both tiers, and every
+  /// message triaged, so iterations after the first read it at ~0.1x input cost
+  /// instead of reprocessing it. Below the model's minimum cacheable prefix the
+  /// breakpoint is a silent no-op (no error, just no cache), so this is safe to
+  /// leave on unconditionally.
+  static List<Map<String, dynamic>>? _systemBlocks(String? system) =>
+      system == null
+          ? null
+          : [
+              {
+                'type': 'text',
+                'text': system,
+                'cache_control': {'type': 'ephemeral'},
+              },
+            ];
+
   @override
   Future<Map<String, dynamic>> createMessage({
     required String model,
@@ -105,7 +124,7 @@ class AnthropicClient extends MessagesApi {
         'model': model,
         'max_tokens': maxTokens,
         'messages': messages,
-        'system': ?system,
+        'system': ?_systemBlocks(system),
         'tools': ?tools,
         'tool_choice': ?toolChoice,
       }),
@@ -136,7 +155,7 @@ class AnthropicClient extends MessagesApi {
         'max_tokens': maxTokens,
         'messages': messages,
         'stream': true,
-        'system': ?system,
+        'system': ?_systemBlocks(system),
         'tools': ?tools,
         'tool_choice': ?toolChoice,
       });

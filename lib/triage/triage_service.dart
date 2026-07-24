@@ -119,8 +119,16 @@ class TriageService {
     void Function(String toolName)? onToolUseStart,
   }) async {
     final streaming = onTextDelta != null || onToolUseStart != null;
-    final tools = triageTools();
-    final system = buildTriageSystemPrompt();
+
+    // Web search is spent only on the escalation tier — the small, high-stakes
+    // minority where an outside fact (status page, docs) can change the call.
+    // The fast first pass stays tool-lean, deterministic, and cheap.
+    final withWebSearch = tier == ModelPolicy.escalation;
+    final tools = <Map<String, dynamic>>[
+      ...triageTools(),
+      if (withWebSearch) webSearchTool(),
+    ];
+    final system = buildTriageSystemPrompt(withWebSearch: withWebSearch);
     final messages = <Map<String, dynamic>>[
       {'role': 'user', 'content': supportMessage},
     ];
@@ -159,6 +167,14 @@ class TriageService {
           content.where((b) => b['type'] == 'tool_use').toList();
 
       if (toolUses.isEmpty) {
+        // A server tool (web_search) ran and the server-side loop paused. Its
+        // query + results are already in the assistant turn we just appended;
+        // re-send to let the server resume — no user message, tool_choice stays
+        // auto. (Adding a "continue" message would break the resume.)
+        if (response['stop_reason'] == 'pause_turn') {
+          continue;
+        }
+
         // The model answered in text without routing. Nudge it once to finish
         // by calling create_ticket, and force that tool on the next turn.
         if (forcedTicket) {
@@ -260,29 +276,31 @@ class TriageService {
 /// Builds the system prompt from the triage rules. The allowed values are
 /// pulled from the taxonomy enums so the prompt can't drift out of sync with
 /// the code; the precedence rules mirror `triage_spec.md`.
-String buildTriageSystemPrompt() {
+String buildTriageSystemPrompt({bool withWebSearch = false}) {
   String wire<T extends Enum>(List<T> values) =>
       values.map((v) => (v as dynamic).wireName as String).join(', ');
+
+  // Only added on the tier that actually has the web_search tool, so the
+  // high-volume first pass isn't told about a tool it can't call.
+  final webSearchGuidance = withWebSearch
+      ? '''
+
+You have a web_search tool, restricted to the product's status page and docs.
+Use it only to settle a classification the message itself can't: check the status
+page to distinguish an active platform outage (urgency = urgent, precedence rule
+3) from an isolated error, and check the docs to distinguish a documented how_to
+from a genuine technical fault. Don't search for anything the message already
+makes clear.
+'''
+      : '';
 
   return '''
 You are a customer-support triage agent. For each customer message: gather any
 context you need with the tools, then classify the message and route it by
-calling create_ticket exactly once, as your final action.
-
-Tools:
-- look_up_customer(email): the customer's plan, tier, and account status. Use it
-  for billing or account issues when an email is present.
-- fetch_order(order_id): the status and amount of an order. Use it when the
-  message references an order, charge, or purchase.
-- fetch_recent_tickets(email): the customer's recent tickets, for context on
-  repeat issues.
-- create_ticket(...): your FINAL action. Submit the classification and route the
-  ticket. Call it exactly once, last.
-
-When you need several independent pieces of context — for example the customer
-record and their recent tickets — request them together in a single turn so they
-run in parallel instead of one after another. Gather everything you need, then
-call create_ticket once.
+calling create_ticket exactly once, as your final action. Each tool's own
+description says what it returns and when to use it. When you need several
+independent pieces of context, request them together in a single turn so they
+run in parallel instead of one after another.
 
 Classify along three axes. Use ONLY these values.
 - urgency (${wire(Urgency.values)}) — impact and time-sensitivity only,
@@ -316,9 +334,5 @@ it sets, and later rules still fill fields an earlier rule left unset:
 Confidence: report your certainty from 0.0 to 1.0. If the message is unclear, you
 cannot confidently pick a topic, or your confidence is below 0.60, set
 needs_human_review = true and team = triage_review.
-
-When you call create_ticket, provide: urgency, topic, team, a one-sentence
-summary, a rationale that names the precedence rule when one applied, confidence,
-needs_human_review, and customer_id / order_id if you looked them up (else null).
-''';
+$webSearchGuidance''';
 }

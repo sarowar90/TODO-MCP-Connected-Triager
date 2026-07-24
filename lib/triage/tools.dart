@@ -137,6 +137,25 @@ List<Map<String, dynamic>> triageTools() {
   ];
 }
 
+/// The built-in **web search** server tool, scoped to the product's status page
+/// and documentation. It runs on Anthropic's servers — the model issues the
+/// query and the results come back in the *same* response as
+/// `web_search_tool_result` blocks, so there is nothing for [ToolExecutor] to
+/// run; we only pass those blocks back on the next turn.
+///
+/// `web_search_20260209` is the current variant (dynamic filtering) supported by
+/// Opus 4.8 — the tier this is attached to. `allowed_domains` fences it to the
+/// two sources that actually change a triage call: the status page (active
+/// outage vs isolated error → urgency) and the docs (documented how_to vs a
+/// genuine technical fault → topic). Swap the placeholders for the org's real
+/// domains.
+Map<String, dynamic> webSearchTool() => {
+      'type': 'web_search_20260209',
+      'name': 'web_search',
+      'max_uses': 3,
+      'allowed_domains': ['status.example.com', 'docs.example.com'],
+    };
+
 /// The result of running a tool: a string payload fed back to the model as a
 /// `tool_result`, plus whether it represents an error.
 class ToolResult {

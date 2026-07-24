@@ -37,6 +37,7 @@ class FakeMessagesApi extends MessagesApi {
       'model': model,
       'messages': List<Map<String, dynamic>>.from(messages),
       'tool_choice': toolChoice,
+      'tools': tools,
     });
     if (_index >= responses.length) {
       throw StateError('FakeMessagesApi ran out of scripted responses.');
@@ -73,6 +74,16 @@ Map<String, dynamic> toolUse(String id, String name, Map<String, dynamic> input)
 
 Map<String, dynamic> assistantToolTurn(List<Map<String, dynamic>> blocks) =>
     {'stop_reason': 'tool_use', 'content': blocks};
+
+/// A turn where a built-in server tool ran and the server-side loop paused.
+/// `server_tool_use` blocks are NOT client `tool_use` — the loop must resume,
+/// not treat them as "answered without routing".
+Map<String, dynamic> assistantPauseTurn(List<Map<String, dynamic>> blocks) =>
+    {'stop_reason': 'pause_turn', 'content': blocks};
+
+Map<String, dynamic> serverToolUse(
+        String id, String name, Map<String, dynamic> input) =>
+    {'type': 'server_tool_use', 'id': id, 'name': name, 'input': input};
 
 Map<String, dynamic> assistantTextTurn(String text) => {
       'stop_reason': 'end_turn',
@@ -196,6 +207,15 @@ void main() {
       expect((props['team'] as Map)['enum'],
           Team.values.map((e) => e.wireName).toList());
     });
+
+    test('web_search is the current, domain-scoped server-tool variant', () {
+      final ws = webSearchTool();
+      expect(ws['type'], 'web_search_20260209');
+      expect(ws['name'], 'web_search');
+      // Fenced to specific sources so it can't roam the open web.
+      expect(ws['allowed_domains'], isNotEmpty);
+      expect(ws['max_uses'], isNotNull);
+    });
   });
 
   group('TriageResult parsing', () {
@@ -308,6 +328,60 @@ void main() {
       expect(api.requests, hasLength(2));
       expect(api.requests[0]['model'], 'claude-haiku-4-5');
       expect(api.requests[1]['model'], 'claude-opus-4-8');
+    });
+
+    test('attaches web_search only to the escalation tier', () async {
+      // Same high-stakes result on both passes, so the loop escalates Haiku ->
+      // Opus and we can inspect the tools sent to each tier.
+      final api = FakeMessagesApi([
+        assistantToolTurn([
+          toolUse('a', 'create_ticket',
+              ticketInput(urgency: 'urgent', topic: 'technical', team: 'engineering'))
+        ]),
+        assistantToolTurn([
+          toolUse('b', 'create_ticket',
+              ticketInput(urgency: 'urgent', topic: 'technical', team: 'engineering'))
+        ]),
+      ]);
+      final service = TriageService(api: api, executor: MockToolExecutor());
+
+      await service.triage('the whole platform is down');
+
+      bool hasWebSearch(Map<String, dynamic> req) =>
+          (req['tools'] as List).any((t) => t['name'] == 'web_search');
+      // Fast first pass (Haiku): no web search — lean and deterministic.
+      expect(api.requests[0]['model'], 'claude-haiku-4-5');
+      expect(hasWebSearch(api.requests[0]), isFalse);
+      // Capable reviewer (Opus): web search attached for the hard cases.
+      expect(api.requests[1]['model'], 'claude-opus-4-8');
+      expect(hasWebSearch(api.requests[1]), isTrue);
+    });
+
+    test('resumes on pause_turn instead of forcing a ticket', () async {
+      // The model runs web_search and the server-side loop pauses. The service
+      // must re-send to let it continue — not read the empty client-tool set as
+      // "ended without routing" and force create_ticket.
+      final api = FakeMessagesApi([
+        assistantPauseTurn([
+          {'type': 'text', 'text': 'Checking the status page.'},
+          serverToolUse('sw1', 'web_search', {'query': 'platform status'}),
+        ]),
+        assistantToolTurn([toolUse('t', 'create_ticket', ticketInput())]),
+      ]);
+      final service = TriageService(api: api, executor: MockToolExecutor());
+
+      final outcome = await service.triage('is the API down for everyone?');
+
+      expect(outcome.ticketId, isNotNull);
+      expect(api.requests, hasLength(2));
+      // The resume kept tool_choice on auto — it did NOT take the forced-ticket
+      // path (which would set {'type': 'tool', 'name': 'create_ticket'}).
+      expect(api.requests[1]['tool_choice'], {'type': 'auto'});
+      // The paused assistant turn (with its server_tool_use) was carried into
+      // the resend so the server can continue where it left off.
+      final resendMessages =
+          api.requests[1]['messages'] as List<Map<String, dynamic>>;
+      expect(resendMessages.last['role'], 'assistant');
     });
 
     test('runs independent tools in parallel, combining results into one turn',
