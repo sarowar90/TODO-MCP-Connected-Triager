@@ -38,13 +38,75 @@ Exit codes: `0` success, `1` agent/API failure, `2` no API key set.
 | File | Role |
 |---|---|
 | [`agent.py`](agent.py) | Entry point: input resolution, API-key check, exit codes |
-| [`loop.py`](loop.py) | The autonomous loop — phase instrumentation, goal check, retry |
+| [`plan.py`](plan.py) | Multi-step execution: decompose the goal, sequence it, carry results |
+| [`loop.py`](loop.py) | The step runner — phase instrumentation, goal check, retry |
 | [`triage_tools.py`](triage_tools.py) | The four custom tools + the closed taxonomy and validation |
-| [`fs_policy.py`](fs_policy.py) | Filesystem containment: roots, path checks, the PreToolUse guard |
+| [`permissions.py`](permissions.py) | The permission strategy: tiers, enforcement, approvers |
+| [`fs_policy.py`](fs_policy.py) | Filesystem roots and path containment checks |
 | [`test_loop.py`](test_loop.py) | Offline checks of the tools and goal logic (21) |
-| [`test_fs_policy.py`](test_fs_policy.py) | Offline checks of containment (31) |
+| [`test_fs_policy.py`](test_fs_policy.py) | Offline checks of path containment (25) |
+| [`test_plan.py`](test_plan.py) | Offline checks of plan decomposition and sequencing (22) |
+| [`test_permissions.py`](test_permissions.py) | Offline checks of every policy row and both enforcement points (37) |
 | `workspace/inbox/` | Input: support messages the agent reads |
 | `workspace/outbox/` | Output: filed tickets the agent writes (gitignored) |
+
+## Permission strategy
+
+The dividing line is **consequence outside the agent's sandbox**, not risk of
+error. Misreading a file costs a retry. Paging on-call at 3am, or routing a
+security report to the wrong queue, costs someone's night or a missed breach —
+and the agent cannot undo either.
+
+| Action | Tier | Why |
+|---|---|---|
+| Read / Glob / Grep inside the repo | **auto** | read-only, reversible, no external effect |
+| Customer / order / ticket-history lookups | **auto** | read-only queries against the mock CRM |
+| Write inside the outbox | **auto** | the agent's own scratch space |
+| `create_ticket`, routine | **auto** | the core job; a normal ticket is revisable |
+| `create_ticket` → `trust_and_safety` | **ask** | security escalation; a wrong call is costly |
+| `create_ticket` → `retention` | **ask** | churn save; commits a human to outreach |
+| `create_ticket` at `urgency=urgent` | **ask** | pages on-call, per the spec's §1 |
+| `create_ticket` with `needs_human_review` | **ask** | the agent has already said it is unsure |
+| Write or edit outside the outbox | **deny** | would mutate source, the spec, or its own inputs |
+| Read outside the repository | **deny** | no reason to reach the wider filesystem |
+| Bash, WebFetch, WebSearch, subagents, anything unrecognised | **deny** | unguarded execution or egress; not needed here |
+
+The ask tier deliberately mirrors the escalation triggers already in
+`ModelPolicy.shouldEscalate` in the Dart triager — the cases worth spending a
+stronger model on are the same ones worth spending a human on.
+
+### How it's enforced
+
+[`permissions.py`](permissions.py) is one `classify()` function consulted at
+**two** points, so the hook and the callback can never disagree:
+
+- A **`PreToolUse` hook** applies it first. Hooks run before every other step
+  and a hook deny wins even under `bypassPermissions`, so denials can't be
+  configured away later by an edit to `allowed_tools` or the permission mode.
+- A **`can_use_tool` callback** applies it again at the approval step, which is
+  where `ask` becomes a real decision.
+
+Two points rather than one because each alone has a hole: a tool named in
+`allowed_tools` is auto-approved and **never reaches `can_use_tool`**, so a
+callback alone would be bypassed for the tools that matter most; and a hook
+alone cannot prompt a human. `create_ticket` is deliberately **left out** of
+`allowed_tools` so every ticket reaches the callback.
+
+Unrecognised tools **fail closed** — a new tool is denied until the policy
+names it, rather than inheriting the permission mode.
+
+### Resolving an approval
+
+| `--approve=` | Behaviour | Use |
+|---|---|---|
+| `deny` *(default)* | refuse anything needing approval, and tell the model why | unattended and scheduled runs |
+| `prompt` | ask on the terminal, showing the ticket fields | an operator working the queue |
+| `auto` | approve everything reaching `ask` | tests and trusted automation only |
+
+Defaulting to `deny` is the point: a batch running on a schedule with nobody
+watching must not be able to page on-call just because the model was confident.
+The refusal is fed back as a tool result, so the agent can reclassify or leave
+the ticket for a human rather than simply failing.
 
 ## Filesystem access
 
@@ -72,11 +134,38 @@ and follows symlinks, so traversal is normalised away rather than pattern-matche
 `Bash` is in `disallowed_tools`: it would be an unguarded write vector sitting
 next to a carefully guarded `Write`.
 
+## Multi-step execution
+
+Running with no arguments triages the **whole inbox**. The goal is decomposed
+into a plan before any work starts, then executed in sequence:
+
+```
+PLAN (built before any work starts)
+  1. [ ] triage 001-api-outage.txt
+  2. [ ] triage 002-double-charge.txt
+  3. [ ] aggregate the batch into digest.md
+```
+
+The digest is what makes this multi-step rather than a loop over independent
+items: it **cannot** run until the triage steps have produced tickets, it reads
+those tickets back off disk, and its goal check asserts it accounts for every
+ticket id the earlier steps returned. Intermediate results travel two ways —
+in `PlanContext` (ticket ids, step results) and on disk (the ticket files).
+
+A failed triage step does **not** abort the batch. The remaining messages are
+still processed and the digest covers whatever was filed, because one
+unparseable message shouldn't strand the rest of the queue. The run as a whole
+still reports failure.
+
+Pass a filename or a literal message to triage just that one — the single-step
+path, no digest.
+
 ## The loop
 
 The Agent SDK runs the **inner** cycle: Claude decides, the SDK executes tools,
 results feed back, repeat until it stops calling tools. `loop.py` adds three
-things on top:
+things on top, exposed as a reusable `run_step` that both the triage and digest
+steps are built from:
 
 1. **Phase instrumentation** — every message is tagged `DECIDE` (Claude's
    reasoning), `ACT` (a tool call), or `OBSERVE` (the tool result), so the
@@ -103,16 +192,22 @@ drops every other built-in from its context.
 ## Tests
 
 ```powershell
-.\.venv\Scripts\python.exe test_loop.py       # 21 checks
-.\.venv\Scripts\python.exe test_fs_policy.py  # 31 checks
+.\.venv\Scripts\python.exe test_loop.py         # 21 checks
+.\.venv\Scripts\python.exe test_fs_policy.py    # 25 checks
+.\.venv\Scripts\python.exe test_plan.py         # 22 checks
+.\.venv\Scripts\python.exe test_permissions.py  # 37 checks
 ```
 
-52 checks, no network and no API key. They cover the taxonomy validation, the
-confidence gate, each context tool, the goal transition (unmet → rejected →
-met), and containment — including traversal, absolute paths outside the repo,
-and a sibling directory whose name merely *starts with* `outbox`.
+105 checks, no network and no API key. They cover the taxonomy validation, the
+confidence gate, each context tool, the goal transitions, plan decomposition
+and sequencing, containment (traversal, absolute paths outside the repo, and a
+sibling directory whose name merely *starts with* `outbox`), and every row of
+the permission table above — including that an auto-approver still cannot grant
+a denied tool.
 
-What they cannot cover is the live agent run — that needs a key.
+**What they cannot cover is the live agent run.** Every goal check, hook, and
+plan transition here is verified against synthetic inputs; none of it has yet
+been exercised by the model actually driving the SDK. That needs a key.
 
 ## Notes for later steps
 

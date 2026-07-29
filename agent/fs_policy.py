@@ -17,7 +17,6 @@ permission checks — `Edit(path)` is what governs `Write` — which makes
 rule-based path scoping easy to get wrong. The hook sidesteps that entirely.
 """
 
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -37,20 +36,6 @@ WRITE_TOOLS = ("Write", "Edit", "NotebookEdit", "MultiEdit")
 READ_TOOLS = ("Read", "Glob", "Grep")
 
 _PATH_KEYS = ("file_path", "notebook_path", "path")
-
-
-@dataclass
-class FsAudit:
-    """Record of every filesystem decision the guard made."""
-
-    allowed: list[tuple[str, str]] = field(default_factory=list)
-    denied: list[tuple[str, str, str]] = field(default_factory=list)
-
-    def record_allow(self, tool: str, path: str) -> None:
-        self.allowed.append((tool, path))
-
-    def record_deny(self, tool: str, path: str, reason: str) -> None:
-        self.denied.append((tool, path, reason))
 
 
 def target_path(tool_input: dict[str, Any]) -> str | None:
@@ -111,37 +96,6 @@ def check_access(tool_name: str, tool_input: dict[str, Any]) -> tuple[bool, str]
         return False, f"reads are confined to the repo; {resolved} is outside it"
 
     return True, "tool is not filesystem-scoped"
-
-
-def make_fs_guard(audit: FsAudit):
-    """Build the PreToolUse hook callback, recording into `audit`."""
-
-    async def fs_guard(
-        input_data: dict[str, Any],
-        tool_use_id: str | None,
-        context: Any,
-    ) -> dict[str, Any]:
-        tool_name = input_data.get("tool_name", "")
-        tool_input = input_data.get("tool_input") or {}
-
-        allowed, reason = check_access(tool_name, tool_input)
-        raw = target_path(tool_input) or ""
-
-        if allowed:
-            if raw:
-                audit.record_allow(tool_name, raw)
-            return {}
-
-        audit.record_deny(tool_name, raw, reason)
-        return {
-            "hookSpecificOutput": {
-                "hookEventName": input_data.get("hook_event_name", "PreToolUse"),
-                "permissionDecision": "deny",
-                "permissionDecisionReason": reason,
-            }
-        }
-
-    return fs_guard
 
 
 def ensure_workspace() -> None:

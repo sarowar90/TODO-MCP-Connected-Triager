@@ -1,22 +1,24 @@
-"""The core autonomous loop.
+"""The core autonomous loop, and the generic step runner built on it.
 
 The Agent SDK runs the *inner* cycle — Claude decides, the SDK executes tools,
-results feed back, repeat until Claude stops calling tools. This module does
-four things on top of it:
+results feed back, repeat until Claude stops calling tools. This module adds:
 
-  1. Instruments each phase so the cycle is observable: DECIDE / ACT / OBSERVE.
-  2. Defines the goal in code, not in the prompt: a validated ticket exists
-     *and* has been written to the outbox.
-  3. Adds the *outer* loop — if Claude stops without meeting the goal,
-     re-prompt with the reason and try again, up to MAX_ATTEMPTS.
-  4. Contains the agent's filesystem access with a PreToolUse hook, so writes
-     land in the outbox and nowhere else (see fs_policy.py).
+  1. Phase instrumentation, so the cycle is observable: DECIDE / ACT / OBSERVE.
+  2. Goals defined in code rather than in the prompt.
+  3. An *outer* loop — if Claude stops without meeting the goal, re-prompt with
+     the reason and try again, up to MAX_ATTEMPTS.
+  4. Filesystem containment via a PreToolUse hook (see fs_policy.py).
+
+`run_step` is the reusable unit: one instrumented agent run plus the retry loop,
+parameterised by system prompt, prompt, and a goal predicate. Both the
+per-message triage step and the digest step in plan.py are built from it, which
+is what makes multi-step execution composable rather than bespoke.
 """
 
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -31,26 +33,27 @@ from claude_agent_sdk import (
     query,
 )
 
-from fs_policy import (
-    INBOX,
-    OUTBOX,
-    READ_TOOLS,
-    REPO_ROOT,
-    WRITE_TOOLS,
-    FsAudit,
-    ensure_workspace,
-    make_fs_guard,
+from fs_policy import OUTBOX, REPO_ROOT, ensure_workspace
+from permissions import (
+    AUTO_APPROVED_TOOLS,
+    DENIED_TOOLS,
+    Approver,
+    DenyApprover,
+    PermissionAudit,
+    make_can_use_tool,
+    make_permission_hook,
 )
-from triage_tools import TOOL_NAMES, TriageSession, build_triage_server
+from triage_tools import TriageSession, build_triage_server
 
 SPEC_PATH = "lib/triage/triage_spec.md"
 OUTBOX_REL = OUTBOX.relative_to(REPO_ROOT).as_posix()
+DIGEST_NAME = "digest.md"
 
 MODEL = "claude-opus-5"
 MAX_ATTEMPTS = 2
 MAX_TURNS = 25
 
-SYSTEM_PROMPT = f"""\
+TRIAGE_SYSTEM_PROMPT = f"""\
 You are a customer-support triage agent.
 
 Work autonomously through this cycle until the task is done:
@@ -75,79 +78,140 @@ needs_human_review=true and team='triage_review'. Keep any text you write to
 one short line per step.
 """
 
+DIGEST_SYSTEM_PROMPT = f"""\
+You are a support-operations analyst writing a shift handover.
+
+Every ticket from this batch has already been filed as a markdown file in
+{OUTBOX_REL}/. Your job is to aggregate them:
+  1. Glob {OUTBOX_REL}/ and read every ticket file (skip {DIGEST_NAME} itself).
+  2. Write {OUTBOX_REL}/{DIGEST_NAME} containing:
+     - a one-line summary of the batch,
+     - a markdown table with one row per ticket: id, urgency, topic, team,
+       whether it needs human review,
+     - counts per team and per urgency,
+     - a "Needs attention first" section naming the highest-urgency tickets and
+       anything flagged for human review, with one line each on why.
+
+Reference every ticket id exactly as it appears in the files. {OUTBOX_REL}/ is
+the only place you may write. Do not re-classify anything — the filed tickets
+are the source of truth.
+"""
+
 
 @dataclass
-class LoopOutcome:
-    """What one full run of the outer loop produced."""
+class StepResult:
+    """What one step produced."""
 
+    name: str
+    goal_met: bool
     session: TriageSession
-    audit: FsAudit
     attempts: int
     turns: int
     cost_usd: float
     stopped_because: str
+    reason: str = ""
+
+
+@dataclass
+class LoopOutcome:
+    """Aggregate of every step in a run."""
+
+    steps: list[StepResult] = field(default_factory=list)
+    audit: PermissionAudit = field(default_factory=PermissionAudit)
     written_files: list[Path] = field(default_factory=list)
+    approver_name: str = DenyApprover.name
 
     @property
     def goal_met(self) -> bool:
-        return self.session.goal_met and bool(self.written_files)
+        return bool(self.steps) and all(step.goal_met for step in self.steps)
+
+    @property
+    def turns(self) -> int:
+        return sum(step.turns for step in self.steps)
+
+    @property
+    def cost_usd(self) -> float:
+        return sum(step.cost_usd for step in self.steps)
+
+    @property
+    def tickets(self) -> list[dict[str, Any]]:
+        return [s.session.ticket for s in self.steps if s.session.ticket]
 
 
-def goal_state(session: TriageSession) -> tuple[bool, str]:
-    """Is the task actually finished? Returns (met, reason-if-not)."""
+# --- goal predicates ---------------------------------------------------------
+
+
+def outbox_files(pattern: str = "*") -> list[Path]:
+    if not OUTBOX.exists():
+        return []
+    return sorted(p for p in OUTBOX.glob(pattern) if p.is_file())
+
+
+def ticket_goal(session: TriageSession) -> tuple[bool, str]:
+    """A triage step is done when a validated ticket is filed *and* written."""
     if session.ticket is None:
         if session.rejections:
             return False, f"create_ticket rejected your arguments: {session.rejections[-1]}"
         return False, "you stopped before calling create_ticket"
 
     ticket_id = session.ticket.get("ticket_id", "")
-    if not _outbox_files(ticket_id):
+    if not [p for p in outbox_files("*.md") if ticket_id in p.name]:
         return False, f"you filed {ticket_id} but never wrote {OUTBOX_REL}/{ticket_id}.md"
     return True, ""
 
 
-def _outbox_files(ticket_id: str = "") -> list[Path]:
-    if not OUTBOX.exists():
-        return []
-    found = sorted(p for p in OUTBOX.glob("**/*") if p.is_file())
-    if ticket_id:
-        found = [p for p in found if ticket_id in p.name]
-    return found
+def make_digest_goal(ticket_ids: list[str]) -> Callable[[TriageSession], tuple[bool, str]]:
+    """The digest is done when it exists and accounts for every ticket."""
+
+    def digest_goal(_session: TriageSession) -> tuple[bool, str]:
+        digest = OUTBOX / DIGEST_NAME
+        if not digest.is_file():
+            return False, f"{OUTBOX_REL}/{DIGEST_NAME} does not exist yet"
+
+        text = digest.read_text(encoding="utf-8", errors="replace")
+        missing = [tid for tid in ticket_ids if tid and tid not in text]
+        if missing:
+            return False, f"{DIGEST_NAME} does not mention {', '.join(missing)}"
+        return True, ""
+
+    return digest_goal
+
+
+# --- instrumented run --------------------------------------------------------
 
 
 def _log(phase: str, detail: str) -> None:
-    print(f"  {phase:<8} {detail}", flush=True)
+    print(f"    {phase:<8} {detail}", flush=True)
 
 
-def _short(value: Any, limit: int = 96) -> str:
+def _short(value: Any, limit: int = 92) -> str:
     text = " ".join(str(value).split())
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
 async def _run_once(
-    prompt: str, session: TriageSession, audit: FsAudit
+    system_prompt: str,
+    prompt: str,
+    session: TriageSession,
+    permissions: PermissionAudit,
+    approver: Approver,
 ) -> tuple[str, int, float]:
     """One pass of the SDK's inner loop, with each phase logged."""
     options = ClaudeAgentOptions(
         model=MODEL,
-        system_prompt=SYSTEM_PROMPT,
+        system_prompt=system_prompt,
         mcp_servers={"triage": build_triage_server(session)},
-        allowed_tools=["Read", "Glob", "Grep", "Write", *TOOL_NAMES],
-        # Only these built-ins exist for the agent. Bash is deliberately absent:
-        # it would be an unguarded write vector alongside Write/Edit.
+        # create_ticket is deliberately not pre-approved: leaving it out is what
+        # guarantees every ticket reaches can_use_tool and the ASK tier.
+        allowed_tools=AUTO_APPROVED_TOOLS,
         tools=["Read", "Glob", "Grep", "Write"],
-        disallowed_tools=["Bash"],
-        # The real containment. Hooks run before allow rules, so this holds
-        # even though Write is auto-approved above.
-        hooks={
-            "PreToolUse": [
-                HookMatcher(
-                    matcher="|".join([*WRITE_TOOLS, *READ_TOOLS]),
-                    hooks=[make_fs_guard(audit)],
-                )
-            ]
-        },
-        permission_mode="acceptEdits",
+        disallowed_tools=list(DENIED_TOOLS),
+        # No matcher: the policy sees every tool call, not just file tools.
+        hooks={"PreToolUse": [HookMatcher(hooks=[make_permission_hook(permissions)])]},
+        can_use_tool=make_can_use_tool(approver, permissions),
+        # "default" means nothing is auto-approved beyond allowed_tools, so
+        # anything unrecognised reaches the callback and fails closed there.
+        permission_mode="default",
         cwd=str(REPO_ROOT),
         max_turns=MAX_TURNS,
     )
@@ -168,13 +232,13 @@ async def _run_once(
                         _log("DECIDE", _short(block.text))
                     elif isinstance(block, ToolUseBlock):
                         name = block.name.replace("mcp__triage__", "")
-                        _log("ACT", f"{name}({_short(block.input, 64)})")
+                        _log("ACT", f"{name}({_short(block.input, 60)})")
 
             elif isinstance(msg, UserMessage):
                 for block in msg.content:
                     if isinstance(block, ToolResultBlock):
                         flag = "rejected " if block.is_error else ""
-                        _log("OBSERVE", f"{flag}{_short(block.content, 80)}")
+                        _log("OBSERVE", f"{flag}{_short(block.content, 76)}")
 
             elif isinstance(msg, ResultMessage):
                 subtype = msg.subtype
@@ -188,78 +252,94 @@ async def _run_once(
     return subtype, turns, cost
 
 
-async def run_triage(message: str) -> LoopOutcome:
-    """Run the outer loop until the goal is met or attempts are exhausted."""
+async def run_step(
+    name: str,
+    system_prompt: str,
+    prompt: str,
+    goal: Callable[[TriageSession], tuple[bool, str]],
+    audit: PermissionAudit,
+    session: TriageSession | None = None,
+    approver: Approver | None = None,
+) -> StepResult:
+    """Run one step to completion: the inner loop plus the retry guard."""
     ensure_workspace()
-    session = TriageSession()
-    audit = FsAudit()
-    prompt = f"Triage this support message:\n\n{message}"
-
+    session = session or TriageSession()
+    approver = approver or DenyApprover()
     attempts = turns = 0
     cost = 0.0
     subtype = "no_result"
+    reason = ""
+    current_prompt = prompt
 
     while attempts < MAX_ATTEMPTS:
         attempts += 1
-        print(f"\n[attempt {attempts}/{MAX_ATTEMPTS}]", flush=True)
+        if attempts > 1:
+            _log("RETRY", f"attempt {attempts}/{MAX_ATTEMPTS}")
 
-        subtype, attempt_turns, attempt_cost = await _run_once(prompt, session, audit)
-        turns += attempt_turns
-        cost += attempt_cost
+        subtype, step_turns, step_cost = await _run_once(
+            system_prompt, current_prompt, session, audit, approver
+        )
+        turns += step_turns
+        cost += step_cost
 
-        met, reason = goal_state(session)
+        met, reason = goal(session)
         if met:
-            ticket_id = (session.ticket or {}).get("ticket_id", "")
-            return LoopOutcome(
-                session, audit, attempts, turns, cost, subtype, _outbox_files(ticket_id)
-            )
+            return StepResult(name, True, session, attempts, turns, cost, subtype)
 
-        # Goal unmet: feed the reason back and go round again. This is the
-        # reliability guard — triage must always yield a routable result.
         _log("GOAL", f"not met - {reason}")
-        prompt = (
+        current_prompt = (
             f"The previous attempt did not finish, because {reason}. "
-            f"Complete the task now for this message:\n\n{message}"
+            f"Complete the task now.\n\n{prompt}"
         )
 
-    return LoopOutcome(session, audit, attempts, turns, cost, subtype, _outbox_files())
+    return StepResult(name, False, session, attempts, turns, cost, subtype, reason)
 
 
 def report(outcome: LoopOutcome) -> int:
     """Print the final state. Returns a process exit code."""
-    session = outcome.session
-    print("\n" + "=" * 68)
+    print("\n" + "=" * 70)
+    print("RUN SUMMARY")
+    print("=" * 70)
 
-    if outcome.goal_met:
-        ticket = session.ticket or {}
-        print("GOAL MET - ticket filed and written")
-        print(f"  ticket      {ticket.get('ticket_id')}")
-        print(f"  urgency     {ticket.get('urgency')}")
-        print(f"  topic       {ticket.get('topic')}")
-        print(f"  team        {ticket.get('team')}")
-        print(f"  confidence  {ticket.get('confidence')}")
-        print(f"  review?     {ticket.get('needs_human_review')}")
-        print(f"  summary     {ticket.get('summary')}")
-    else:
-        print("GOAL NOT MET", file=sys.stderr)
-        print(f"  stopped because: {outcome.stopped_because}", file=sys.stderr)
-        print(f"  reason: {goal_state(session)[1]}", file=sys.stderr)
+    for step in outcome.steps:
+        mark = "OK  " if step.goal_met else "FAIL"
+        retried = f" ({step.attempts} attempts)" if step.attempts > 1 else ""
+        print(f"  [{mark}] {step.name}{retried}")
+        if not step.goal_met:
+            print(f"         {step.reason}", file=sys.stderr)
+
+    tickets = outcome.tickets
+    if tickets:
+        print("\n  tickets filed")
+        for ticket in tickets:
+            print(
+                f"    {ticket.get('ticket_id'):<10} "
+                f"{ticket.get('urgency'):<7} {ticket.get('topic'):<15} "
+                f"-> {ticket.get('team')}"
+                + ("  [review]" if ticket.get("needs_human_review") else "")
+            )
 
     print("\n  filesystem")
     for path in outcome.written_files:
         print(f"    wrote   {path.relative_to(REPO_ROOT).as_posix()}")
     if not outcome.written_files:
         print("    wrote   (nothing)")
-    for tool, path, reason in outcome.audit.denied:
-        print(f"    BLOCKED {tool} -> {path} ({reason})")
-    if not outcome.audit.denied:
-        print("    blocked (nothing - the agent stayed in bounds)")
+
+    print(f"\n  permissions  (approver: {outcome.approver_name})")
+    for tool, reason, granted in outcome.audit.asked:
+        verdict = "APPROVED" if granted else "REFUSED "
+        print(f"    {verdict} {tool.replace('mcp__triage__', '')} - {reason}")
+    for tool, reason in outcome.audit.denied:
+        print(f"    DENIED   {tool.replace('mcp__triage__', '')} - {reason}")
+    if not outcome.audit.asked and not outcome.audit.denied:
+        print("    nothing required approval and nothing was denied")
+    print(f"    {len(outcome.audit.auto)} call(s) auto-approved")
 
     print(
-        f"\n  {outcome.attempts} attempt(s) · {outcome.turns} turns · "
-        f"{len(session.tool_calls)} tool calls · ${outcome.cost_usd:.4f}"
+        f"\n  {len(outcome.steps)} steps · {outcome.turns} turns · "
+        f"${outcome.cost_usd:.4f}"
     )
-    print(f"  tool sequence: {' -> '.join(session.tool_calls) or '(none)'}")
-    print("=" * 68)
+    print("=" * 70)
+    print("GOAL MET" if outcome.goal_met else "GOAL NOT MET")
 
     return 0 if outcome.goal_met else 1

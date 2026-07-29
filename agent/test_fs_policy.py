@@ -10,15 +10,7 @@ Run:
 
 import asyncio
 
-from fs_policy import (
-    INBOX,
-    OUTBOX,
-    REPO_ROOT,
-    FsAudit,
-    check_access,
-    make_fs_guard,
-    target_path,
-)
+from fs_policy import INBOX, OUTBOX, REPO_ROOT, check_access, target_path
 
 passed = failed = 0
 
@@ -104,44 +96,16 @@ async def main() -> int:
         check_access("Grep", {"pattern": "TODO"})[0],
     )
 
-    print("\nhook wiring")
-    audit = FsAudit()
-    guard = make_fs_guard(audit)
-
-    ok = await guard(
-        {
-            "hook_event_name": "PreToolUse",
-            "tool_name": "Write",
-            "tool_input": {"file_path": str(OUTBOX / "TICK-1.md")},
-        },
-        None,
-        None,
-    )
-    check("allowed call returns an empty decision", ok == {})
-    check("allowed call is audited", len(audit.allowed) == 1)
-
-    blocked = await guard(
-        {
-            "hook_event_name": "PreToolUse",
-            "tool_name": "Write",
-            "tool_input": {"file_path": str(REPO_ROOT / "lib" / "main.dart")},
-        },
-        None,
-        None,
-    )
-    decision = blocked.get("hookSpecificOutput", {})
-    check("blocked call returns a deny decision", decision.get("permissionDecision") == "deny")
-    check("deny carries a reason for the model to read", bool(decision.get("permissionDecisionReason")))
-    check("deny echoes the hook event name", decision.get("hookEventName") == "PreToolUse")
-    check("blocked call is audited", len(audit.denied) == 1)
+    # Hook and callback wiring on top of these path checks lives in
+    # test_permissions.py, since the policy engine is what consumes them.
 
     print("\ninbox input resolution")
-    from agent import resolve_input
+    from agent import resolve_single
 
-    msg, src = resolve_input(["001-api-outage.txt"])
+    msg, src = resolve_single(["001-api-outage.txt"])
     check("reads a real inbox file", src == "001-api-outage.txt" and "jane@" in msg)
 
-    msg, src = resolve_input(["not-a-file.txt"])
+    msg, src = resolve_single(["not-a-file.txt"])
     check("a missing file falls back to literal text", src == "(command line)")
 
     # Regression: a traversal argument pointing at a file that really exists
@@ -152,7 +116,7 @@ async def main() -> int:
         import os
 
         rel = os.path.relpath(sentinel, INBOX)
-        msg, src = resolve_input([rel])
+        msg, src = resolve_single([rel])
         check(
             "traversal cannot read a file outside the inbox",
             src == "(command line)" and "sentinel-secret" not in msg,
