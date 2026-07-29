@@ -1,0 +1,6 @@
+From: jane@example.com
+Order: ORD-1002
+
+URGENT: our whole team is locked out - the API has returned 500 on every
+request since 9am, and we are now getting billing-failed emails too.
+This blocks all work.

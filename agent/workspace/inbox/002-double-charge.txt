@@ -1,0 +1,5 @@
+From: sam@example.com
+Order: ORD-1003
+
+I was charged twice for this month's subscription and the second payment
+shows as failed on my statement. Can someone sort out the refund?

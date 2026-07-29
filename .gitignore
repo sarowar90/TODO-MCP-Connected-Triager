@@ -47,3 +47,7 @@ app.*.map.json
 # Capstone agent (Python / Claude Agent SDK)
 agent/.venv/
 __pycache__/
+
+# Agent-generated output; the folder is kept, its contents are not
+agent/workspace/outbox/*
+!agent/workspace/outbox/.gitkeep

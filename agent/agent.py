@@ -1,109 +1,43 @@
-"""Minimal Claude Agent SDK skeleton for the support triager.
+"""Entry point for the capstone triage agent.
 
-Step 2 of the capstone: confirm the Agent SDK runs end to end. This is
-deliberately small — one `query()` call, read-only tools, streamed output —
-and is the skeleton the production agent grows from in later steps.
+Step 2 stood the Agent SDK up, step 3 grew the autonomous loop, step 4 gave it
+an inbox to read and an outbox to write. This file handles argv, the API key
+check, and exit codes.
 
 Run:
     $env:ANTHROPIC_API_KEY = "sk-ant-..."   # PowerShell
-    .venv\\Scripts\\python.exe agent.py
-    .venv\\Scripts\\python.exe agent.py "my own support message"
+
+    .venv\\Scripts\\python.exe agent.py                       # first inbox file
+    .venv\\Scripts\\python.exe agent.py 002-double-charge.txt  # a named one
+    .venv\\Scripts\\python.exe agent.py "I was charged twice"  # literal text
 """
 
 import asyncio
 import os
 import sys
-from pathlib import Path
 
-from claude_agent_sdk import (
-    AssistantMessage,
-    ClaudeAgentOptions,
-    ClaudeSDKError,
-    CLINotFoundError,
-    ResultMessage,
-    TextBlock,
-    ToolUseBlock,
-    query,
-)
-
-# The triage spec lives in the Dart package one level up; the agent reads it
-# from disk rather than having the rules baked into the prompt.
-REPO_ROOT = Path(__file__).resolve().parent.parent
-SPEC_PATH = "lib/triage/triage_spec.md"
-
-MODEL = "claude-opus-5"
-
-SYSTEM_PROMPT = (
-    "You are a customer-support triage agent. Read the triage specification "
-    f"at {SPEC_PATH} before classifying anything, and apply its precedence "
-    "rules exactly. Answer with the urgency, topic, owning team, a one-line "
-    "summary, and the rule number you applied. Be concise."
-)
-
-SAMPLE_MESSAGE = (
-    "URGENT: our whole team is locked out - the API has returned 500 on every "
-    "request since 9am, and we are now getting billing-failed emails too. "
-    "This blocks all work."
-)
+from fs_policy import INBOX, REPO_ROOT, ensure_workspace
+from loop import report, run_triage
 
 
-async def triage(message: str) -> int:
-    """Run one triage pass. Returns a process exit code."""
-    options = ClaudeAgentOptions(
-        model=MODEL,
-        system_prompt=SYSTEM_PROMPT,
-        # Read-only: this skeleton inspects the repo, it never writes to it.
-        allowed_tools=["Read", "Glob", "Grep"],
-        permission_mode="dontAsk",
-        cwd=str(REPO_ROOT),
-        max_turns=10,
-    )
+def resolve_input(argv: list[str]) -> tuple[str, str] | None:
+    """Return (message, source label), or None if there is nothing to triage."""
+    ensure_workspace()
 
-    prompt = f"Triage this support message:\n\n{message}"
-    result: ResultMessage | None = None
+    if argv:
+        # Resolve before testing: a traversal argument like ../../secrets.txt
+        # would otherwise be read straight off disk and fed to the model.
+        candidate = (INBOX / argv[0]).resolve()
+        inside_inbox = candidate == INBOX or candidate.is_relative_to(INBOX.resolve())
+        if inside_inbox and candidate.is_file():
+            return candidate.read_text(encoding="utf-8"), candidate.name
+        return " ".join(argv), "(command line)"
 
-    # ResultMessage is terminal: stop reading there. Continuing to iterate past
-    # it makes the SDK raise ("Claude Code returned an error result"), and
-    # returning from inside the loop closes its generator mid-run.
-    try:
-        async for msg in query(prompt=prompt, options=options):
-            if isinstance(msg, AssistantMessage):
-                for block in msg.content:
-                    if isinstance(block, TextBlock):
-                        print(block.text)
-                    elif isinstance(block, ToolUseBlock):
-                        print(f"  [tool] {block.name}")
-            elif isinstance(msg, ResultMessage):
-                result = msg
-                break
-    except CLINotFoundError:
-        print(
-            "Could not start the bundled Claude Code binary. Reinstall with "
-            "`pip install --force-reinstall claude-agent-sdk`.",
-            file=sys.stderr,
-        )
-        return 1
-    except ClaudeSDKError as exc:
-        print(f"Agent SDK error: {exc}", file=sys.stderr)
-        return 1
-
-    if result is None:
-        print("\nAgent stream ended without a result message.", file=sys.stderr)
-        return 1
-
-    # `subtype` reports "success" even for a run that failed on auth — is_error
-    # is the signal that actually reflects the outcome.
-    if result.is_error:
-        print(f"\n--- failed ({result.subtype}) ---", file=sys.stderr)
-        if result.api_error_status:
-            print(f"    HTTP {result.api_error_status}", file=sys.stderr)
-        for err in result.errors or []:
-            print(f"    {err}", file=sys.stderr)
-        return 1
-
-    cost = f" · ${result.total_cost_usd:.4f}" if result.total_cost_usd else ""
-    print(f"\n--- done in {result.num_turns} turns{cost} ---")
-    return 0
+    inbox_files = sorted(p for p in INBOX.glob("*.txt") if p.is_file())
+    if not inbox_files:
+        return None
+    first = inbox_files[0]
+    return first.read_text(encoding="utf-8"), first.name
 
 
 def main() -> int:
@@ -116,8 +50,23 @@ def main() -> int:
         )
         return 2
 
-    message = " ".join(sys.argv[1:]) or SAMPLE_MESSAGE
-    return asyncio.run(triage(message))
+    resolved = resolve_input(sys.argv[1:])
+    if resolved is None:
+        print(
+            f"Nothing to triage: {INBOX.relative_to(REPO_ROOT).as_posix()}/ is "
+            "empty. Add a .txt file, or pass a message as an argument.",
+            file=sys.stderr,
+        )
+        return 2
+
+    message, source = resolved
+    print("=" * 68)
+    print(f"INCOMING SUPPORT MESSAGE  ({source})")
+    print("=" * 68)
+    print(message.strip())
+
+    outcome = asyncio.run(run_triage(message))
+    return report(outcome)
 
 
 if __name__ == "__main__":
