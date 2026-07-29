@@ -33,7 +33,7 @@ from claude_agent_sdk import (
 )
 
 from checkpoints import CheckpointStore
-from fs_policy import OUTBOX, REPO_ROOT, WORKSPACE, ensure_workspace
+from fs_policy import AGENT_DIR, OUTBOX, REPO_ROOT, WORKSPACE, ensure_workspace
 from hooks import Journal, build_hooks
 from permissions import (
     AUTO_APPROVED_TOOLS,
@@ -48,8 +48,37 @@ from triage_tools import TriageSession, build_triage_server
 SPEC_PATH = "lib/triage/triage_spec.md"
 # Per-run CLI config, kept out of ~/.claude so runs cannot share global state.
 CONFIG_DIR = WORKSPACE / ".claude-config"
+
+# Pre-built skills live here. Loaded as a *plugin path* rather than through
+# setting_sources=["project"], because that would also re-enable the repo's
+# CLAUDE.md and .claude/ — the leak closed in step 8. Plugins load skills from
+# an explicit directory without dragging the rest of the project settings in.
+SKILLS_DIR = AGENT_DIR / "skills"
+ENABLED_SKILLS = ["xlsx"]
+
+
+def _skill_plugins() -> list[dict[str, str]]:
+    """The skills plugin, if the directory has been populated (see README)."""
+    if not SKILLS_DIR.is_dir() or not any(SKILLS_DIR.glob("*/SKILL.md")):
+        return []
+    return [{"type": "local", "path": str(SKILLS_DIR)}]
+
+
+def skills_available() -> bool:
+    return bool(_skill_plugins())
 OUTBOX_REL = OUTBOX.relative_to(REPO_ROOT).as_posix()
 DIGEST_NAME = "digest.md"
+WORKBOOK_NAME = "handover.xlsx"
+WORKBOOK_SHEET = "Tickets"
+WORKBOOK_HEADERS = (
+    "ticket_id",
+    "urgency",
+    "topic",
+    "team",
+    "confidence",
+    "needs_human_review",
+    "summary",
+)
 
 MODEL = "claude-opus-5"
 MAX_ATTEMPTS = 2
@@ -94,9 +123,17 @@ Every ticket from this batch has already been filed as a markdown file in
      - a "Needs attention first" section naming the highest-urgency tickets and
        anything flagged for human review, with one line each on why.
 
+  3. Build the handover workbook at {OUTBOX_REL}/{WORKBOOK_NAME} using the
+     xlsx skill. It needs a sheet named {WORKBOOK_SHEET!r} whose first row is
+     exactly these headers:
+       {', '.join(WORKBOOK_HEADERS)}
+     followed by one row per ticket. Add a second sheet with counts per team
+     and per urgency, using formulas (COUNTIF/COUNTIFS) rather than typing the
+     totals, so the figures recalculate if a row is edited.
+
 Reference every ticket id exactly as it appears in the files. {OUTBOX_REL}/ is
-the only place you may write. Do not re-classify anything — the filed tickets
-are the source of truth.
+the only place you may write — including any helper script you run. Do not
+re-classify anything — the filed tickets are the source of truth.
 """
 
 
@@ -182,6 +219,66 @@ def make_digest_goal(ticket_ids: list[str]) -> Callable[[TriageSession], tuple[b
     return digest_goal
 
 
+def check_workbook(ticket_ids: list[str]) -> tuple[bool, str]:
+    """Is the handover workbook a real, correct .xlsx?
+
+    Deliberately opens the file with openpyxl rather than checking that a file
+    exists: a document deliverable that cannot be opened is not a deliverable,
+    and "the agent said it wrote it" is not evidence.
+    """
+    path = OUTBOX / WORKBOOK_NAME
+    if not path.is_file():
+        return False, f"{OUTBOX_REL}/{WORKBOOK_NAME} does not exist yet"
+
+    try:
+        from openpyxl import load_workbook
+    except ImportError:  # pragma: no cover - openpyxl is pinned in requirements
+        return True, "openpyxl unavailable; existence checked only"
+
+    try:
+        book = load_workbook(path)
+    except Exception as exc:  # noqa: BLE001 - any failure to open is a failure
+        return False, f"{WORKBOOK_NAME} does not open as a workbook: {exc}"
+
+    if WORKBOOK_SHEET not in book.sheetnames:
+        return False, f"{WORKBOOK_NAME} has no {WORKBOOK_SHEET!r} sheet (got {book.sheetnames})"
+
+    sheet = book[WORKBOOK_SHEET]
+    header = [str(c.value).strip().lower() if c.value else "" for c in sheet[1]]
+    missing_cols = [h for h in WORKBOOK_HEADERS if h not in header]
+    if missing_cols:
+        return False, f"{WORKBOOK_NAME} is missing column(s): {', '.join(missing_cols)}"
+
+    body = "\n".join(
+        str(cell.value)
+        for row in sheet.iter_rows(min_row=2)
+        for cell in row
+        if cell.value is not None
+    )
+    absent = [tid for tid in ticket_ids if tid and tid not in body]
+    if absent:
+        return False, f"{WORKBOOK_NAME} has no row for {', '.join(absent)}"
+
+    return True, ""
+
+
+def make_deliverable_goal(
+    ticket_ids: list[str],
+) -> Callable[[TriageSession], tuple[bool, str]]:
+    """Digest *and* workbook, when the skill is available to build one."""
+    digest_goal = make_digest_goal(ticket_ids)
+
+    def deliverable_goal(session: TriageSession) -> tuple[bool, str]:
+        met, reason = digest_goal(session)
+        if not met:
+            return False, reason
+        if not skills_available():
+            return True, ""
+        return check_workbook(ticket_ids)
+
+    return deliverable_goal
+
+
 # --- instrumented run --------------------------------------------------------
 
 
@@ -210,8 +307,12 @@ async def _run_once(
         # create_ticket is deliberately not pre-approved: leaving it out is what
         # guarantees every ticket reaches can_use_tool and the ASK tier.
         allowed_tools=AUTO_APPROVED_TOOLS,
-        tools=["Read", "Glob", "Grep", "Write"],
+        # Bash and Skill are present only so a document skill can run; both are
+        # gated by the policy, and Bash only passes as a confined python call.
+        tools=["Read", "Glob", "Grep", "Write", "Bash", "Skill"],
         disallowed_tools=list(DENIED_TOOLS),
+        plugins=_skill_plugins(),
+        skills=ENABLED_SKILLS if _skill_plugins() else [],
         # Lifecycle hooks; PreToolUse among them carries the permission policy.
         # No matchers, so the policy sees every tool call, not just file tools.
         hooks=build_hooks(journal, permissions),

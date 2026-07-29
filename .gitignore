@@ -56,3 +56,7 @@ agent/workspace/outbox/*
 agent/workspace/.checkpoints/
 agent/workspace/.test-scratch/
 agent/workspace/.test-checkpoints/
+
+# Third-party skills are installed locally, not vendored (see agent/skills/README.md)
+agent/skills/*
+!agent/skills/README.md

@@ -29,11 +29,13 @@ from loop import (
     DIGEST_NAME,
     DIGEST_SYSTEM_PROMPT,
     TRIAGE_SYSTEM_PROMPT,
+    WORKBOOK_NAME,
     LoopOutcome,
     StepResult,
-    make_digest_goal,
+    make_deliverable_goal,
     outbox_files,
     run_step,
+    skills_available,
     ticket_goal,
 )
 from triage_tools import TriageSession
@@ -105,7 +107,10 @@ def build_plan(messages: list[tuple[str, str]]) -> Plan:
     plan = Plan()
     for source, _ in messages:
         plan.add(f"triage:{source}", f"triage {source}")
-    plan.add("digest", f"aggregate the batch into {DIGEST_NAME}")
+    deliverables = (
+        f"{DIGEST_NAME} + {WORKBOOK_NAME}" if skills_available() else DIGEST_NAME
+    )
+    plan.add("digest", f"aggregate the batch into {deliverables}")
     return plan
 
 
@@ -179,7 +184,7 @@ async def run_plan(outcome: LoopOutcome, approver=None) -> LoopOutcome:
             f"{filed}\n\n"
             f"Read each ticket file and write the handover digest."
         ),
-        goal=make_digest_goal(context.ticket_ids),
+        goal=make_deliverable_goal(context.ticket_ids),
         audit=outcome.audit,
         session=TriageSession(),
         approver=approver,

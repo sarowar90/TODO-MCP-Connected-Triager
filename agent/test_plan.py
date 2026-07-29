@@ -117,6 +117,49 @@ async def main() -> int:
         if stale is not None:
             digest.write_text(stale, encoding="utf-8")
 
+    print("\nworkbook deliverable")
+    from loop import WORKBOOK_HEADERS, WORKBOOK_NAME, WORKBOOK_SHEET, check_workbook
+
+    workbook = OUTBOX / WORKBOOK_NAME
+    stash = workbook.read_bytes() if workbook.is_file() else None
+    try:
+        workbook.unlink(missing_ok=True)
+        met, reason = check_workbook(["TICK-1"])
+        check("unmet when the workbook is absent", not met and "does not exist" in reason)
+
+        workbook.write_bytes(b"this is not a spreadsheet")
+        met, reason = check_workbook(["TICK-1"])
+        check("a non-xlsx file is rejected, not merely counted", not met and "does not open" in reason)
+
+        from openpyxl import Workbook
+
+        book = Workbook()
+        book.active.title = WORKBOOK_SHEET
+        book.active.append(list(WORKBOOK_HEADERS))
+        book.save(workbook)
+        met, reason = check_workbook(["TICK-1"])
+        check("a workbook with no row for a ticket is rejected", not met and "no row" in reason)
+
+        book = Workbook()
+        book.active.title = WORKBOOK_SHEET
+        book.active.append(list(WORKBOOK_HEADERS)[:-1])  # drop a column
+        book.active.append(["TICK-1"])
+        book.save(workbook)
+        met, reason = check_workbook(["TICK-1"])
+        check("a missing column is rejected", not met and "missing column" in reason)
+
+        book = Workbook()
+        book.active.title = WORKBOOK_SHEET
+        book.active.append(list(WORKBOOK_HEADERS))
+        book.active.append(["TICK-1", "high", "billing", "billing", 0.9, False, "x"])
+        book.save(workbook)
+        met, _ = check_workbook(["TICK-1"])
+        check("a correct workbook is accepted", met)
+    finally:
+        workbook.unlink(missing_ok=True)
+        if stash is not None:
+            workbook.write_bytes(stash)
+
     print("\noutcome aggregation")
     outcome = LoopOutcome()
     outcome.steps = [

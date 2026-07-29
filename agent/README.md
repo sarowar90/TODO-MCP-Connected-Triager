@@ -45,6 +45,8 @@ Exit codes: `0` success, `1` agent/API failure, `2` no API key set.
 | [`hooks.py`](hooks.py) | Lifecycle hooks and the run journal |
 | [`checkpoints.py`](checkpoints.py) | Workspace snapshots and rollback |
 | [`demo_rollback.py`](demo_rollback.py) | Offline demonstration of recovering from a bad change |
+| [`demo_xlsx.py`](demo_xlsx.py) | Offline demonstration that the handover workbook opens and is correct |
+| [`skills/`](skills/README.md) | Where the pre-built xlsx skill is installed (not vendored) |
 | [`Dockerfile`](Dockerfile) / [`compose.yaml`](compose.yaml) | Container image and hardened run configuration |
 | [`HOSTING.md`](HOSTING.md) | How it is sandboxed and hosted, and what each layer prevents |
 | [`fs_policy.py`](fs_policy.py) | Filesystem roots and path containment checks |
@@ -70,6 +72,44 @@ source, so the agent cannot read or leak it.
 
 Full rationale, the layer-by-layer threat model, and the known gaps (no egress
 proxy, no `SessionStore`, image never built) are in [`HOSTING.md`](HOSTING.md).
+
+## Document output (pre-built xlsx skill)
+
+The digest step produces a shift-handover workbook, `workspace/outbox/handover.xlsx`,
+using Anthropic's pre-built **xlsx** skill: a `Tickets` sheet with one row per
+ticket and fixed headers, plus a `Summary` sheet whose counts are `COUNTIF`
+formulas rather than typed totals.
+
+```powershell
+.\.venv\Scripts\python.exe demo_xlsx.py   # offline: build, validate, read back
+```
+
+The skill is **not vendored** — Anthropic's document skills are source-available,
+not open source, so installing them is a licensing decision left to you. See
+[`skills/README.md`](skills/README.md) for the one-line install. With
+`skills/` empty the agent still runs; the workbook simply is not part of the
+goal, gated by `loop.skills_available()`.
+
+Two things this forced, both deliberate:
+
+- **Loaded as a plugin path, not a project setting source.** `setting_sources=["project"]`
+  would load skills *and* re-enable the repo's `CLAUDE.md` and `.claude/` — the
+  leak closed in step 8. `plugins=[{"type":"local","path":…}]` loads the skill
+  directory and nothing else.
+- **`Bash` had to come back, narrowly.** A document skill builds its file by
+  running Python, so the blanket deny from step 6 would deny the skill. Bash is
+  now admitted only as a single `python`/`python3` invocation, with no shell
+  metacharacters and no path outside the outbox. `python -c` is rejected
+  outright, since an inline script's contents can't be checked as paths. 20
+  allowlist checks in [`test_permissions.py`](test_permissions.py) cover the
+  attack shapes: `;`, `&&`, `|`, backticks, `$( )`, redirection, `&`, newline
+  smuggling, and scripts outside the outbox.
+
+`loop.check_workbook()` **opens** the result with openpyxl rather than checking
+that a file exists — a document that won't open isn't a deliverable, and "the
+agent said it wrote it" isn't evidence. It fails the step if the workbook is
+missing, unopenable, missing the `Tickets` sheet, missing a column, or missing
+a ticket.
 
 ## Checkpointing and rollback
 
@@ -270,13 +310,13 @@ drops every other built-in from its context.
 ```powershell
 .\.venv\Scripts\python.exe test_loop.py         # 21 checks
 .\.venv\Scripts\python.exe test_fs_policy.py    # 25 checks
-.\.venv\Scripts\python.exe test_plan.py         # 22 checks
-.\.venv\Scripts\python.exe test_permissions.py  # 37 checks
+.\.venv\Scripts\python.exe test_plan.py         # 27 checks
+.\.venv\Scripts\python.exe test_permissions.py  # 57 checks
 .\.venv\Scripts\python.exe test_checkpoints.py  # 41 checks
 .\.venv\Scripts\python.exe test_hosting.py      # 36 checks
 ```
 
-182 checks, no network and no API key. They cover the taxonomy validation, the
+207 checks, no network and no API key. They cover the taxonomy validation, the
 confidence gate, each context tool, the goal transitions, plan decomposition
 and sequencing, containment (traversal, absolute paths outside the repo, and a
 sibling directory whose name merely *starts with* `outbox`), and every row of
