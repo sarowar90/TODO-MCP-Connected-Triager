@@ -1,0 +1,55 @@
+# Hardened run configuration for the triage agent.
+#
+#   docker compose -f agent/compose.yaml run --rm agent
+#
+# Run from the repository root. The API key comes from the host environment or
+# a secret manager — never from this file and never from the image.
+
+services:
+  agent:
+    build:
+      context: ..
+      dockerfile: agent/Dockerfile
+    image: triage-agent
+
+    # --- the only secret, injected at run time -------------------------------
+    environment:
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:?set ANTHROPIC_API_KEY before running}
+
+    # --- filesystem ----------------------------------------------------------
+    # Everything is read-only except the workspace. Even if the permission
+    # policy were bypassed, there is nothing else on disk the agent can write.
+    read_only: true
+    volumes:
+      - ./workspace/inbox:/app/workspace/inbox:ro   # inputs, read-only
+      - agent-outbox:/app/workspace                 # outputs, writable
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+
+    # --- privileges ----------------------------------------------------------
+    user: "10001:10001"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+    # --- resources -----------------------------------------------------------
+    # The docs suggest ~1 GiB / 1 CPU per agent as a starting point. pids_limit
+    # bounds a fork bomb; the SDK spawns one CLI subprocess per session.
+    mem_limit: 1g
+    cpus: "1.0"
+    pids_limit: 256
+
+    # --- network -------------------------------------------------------------
+    # The SDK needs outbound HTTPS to api.anthropic.com and nothing else. This
+    # bridge does not restrict egress by domain on its own — see HOSTING.md for
+    # the egress-proxy pattern that does.
+    networks:
+      - egress
+
+volumes:
+  agent-outbox:
+
+networks:
+  egress:
+    driver: bridge

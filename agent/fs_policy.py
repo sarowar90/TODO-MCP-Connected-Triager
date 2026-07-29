@@ -17,11 +17,17 @@ permission checks — `Edit(path)` is what governs `Write` — which makes
 rule-based path scoping easy to get wrong. The hook sidesteps that entirely.
 """
 
+import os
 from pathlib import Path
 from typing import Any
 
 AGENT_DIR = Path(__file__).resolve().parent
-REPO_ROOT = AGENT_DIR.parent
+
+# The read root. Derived from the layout by default, but overridable, because
+# the derivation is wrong in a container: with the code at /app, the parent is
+# "/" and the read root would silently become the entire filesystem. The image
+# sets AGENT_REPO_ROOT=/app so containment holds there too.
+REPO_ROOT = Path(os.environ.get("AGENT_REPO_ROOT") or AGENT_DIR.parent).resolve()
 WORKSPACE = AGENT_DIR / "workspace"
 INBOX = WORKSPACE / "inbox"
 OUTBOX = WORKSPACE / "outbox"

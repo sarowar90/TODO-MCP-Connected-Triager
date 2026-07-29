@@ -45,6 +45,8 @@ Exit codes: `0` success, `1` agent/API failure, `2` no API key set.
 | [`hooks.py`](hooks.py) | Lifecycle hooks and the run journal |
 | [`checkpoints.py`](checkpoints.py) | Workspace snapshots and rollback |
 | [`demo_rollback.py`](demo_rollback.py) | Offline demonstration of recovering from a bad change |
+| [`Dockerfile`](Dockerfile) / [`compose.yaml`](compose.yaml) | Container image and hardened run configuration |
+| [`HOSTING.md`](HOSTING.md) | How it is sandboxed and hosted, and what each layer prevents |
 | [`fs_policy.py`](fs_policy.py) | Filesystem roots and path containment checks |
 | [`test_loop.py`](test_loop.py) | Offline checks of the tools and goal logic (21) |
 | [`test_fs_policy.py`](test_fs_policy.py) | Offline checks of path containment (25) |
@@ -52,6 +54,22 @@ Exit codes: `0` success, `1` agent/API failure, `2` no API key set.
 | [`test_permissions.py`](test_permissions.py) | Offline checks of every policy row and both enforcement points (37) |
 | `workspace/inbox/` | Input: support messages the agent reads |
 | `workspace/outbox/` | Output: filed tickets the agent writes (gitignored) |
+
+## Running it sandboxed
+
+```bash
+docker build -f agent/Dockerfile -t triage-agent .      # from the repo root
+export ANTHROPIC_API_KEY=sk-ant-...
+docker compose -f agent/compose.yaml run --rm agent
+```
+
+Non-root, read-only root filesystem, all capabilities dropped, capped memory
+and pids, read-only inbox mount, and no API key in the image. The image ships
+the triage spec and the agent's code but **not** the Flutter application
+source, so the agent cannot read or leak it.
+
+Full rationale, the layer-by-layer threat model, and the known gaps (no egress
+proxy, no `SessionStore`, image never built) are in [`HOSTING.md`](HOSTING.md).
 
 ## Checkpointing and rollback
 
@@ -255,9 +273,10 @@ drops every other built-in from its context.
 .\.venv\Scripts\python.exe test_plan.py         # 22 checks
 .\.venv\Scripts\python.exe test_permissions.py  # 37 checks
 .\.venv\Scripts\python.exe test_checkpoints.py  # 41 checks
+.\.venv\Scripts\python.exe test_hosting.py      # 36 checks
 ```
 
-146 checks, no network and no API key. They cover the taxonomy validation, the
+182 checks, no network and no API key. They cover the taxonomy validation, the
 confidence gate, each context tool, the goal transitions, plan decomposition
 and sequencing, containment (traversal, absolute paths outside the repo, and a
 sibling directory whose name merely *starts with* `outbox`), and every row of
