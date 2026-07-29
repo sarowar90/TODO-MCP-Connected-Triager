@@ -13,6 +13,37 @@ the offline test suite is [`test/triage_test.dart`](../test/triage_test.dart)
 
 ---
 
+## Purpose — what this agent solves
+
+This agent solves the **first-touch triage problem** in a customer-support inbox:
+inbound messages arrive as unstructured free text, and a human has to read each
+one, judge how urgent it is, work out what it's about, and hand it to the team
+that owns it — slowly, and inconsistently across reviewers and shifts. The
+**input** is a single raw support message (plus whatever identifiers it happens to
+carry, such as the sender's email or an order ID) and read-only access to customer
+context: a CRM lookup, order records, and the sender's recent ticket history. The
+agent classifies the message onto a **closed taxonomy** — one `urgency`, one
+`topic`, and one owning `team` — under the ordered precedence rules in
+[`triage_spec.md`](../lib/triage/triage_spec.md) (safety → churn → outage → topic
+default), pulling the context it needs via parallel tool calls and escalating
+uncertain or high-stakes cases from Haiku 4.5 to Opus 4.8 before committing. A
+**successful outcome** is a message in, a routed ticket out: a strictly validated
+`TriageResult` with a summary, a rationale citing the rule that applied, and a
+self-reported confidence score; a GitHub issue filed for genuine bugs (deduped
+first); a notification posted to the owning team's Slack channel, where the
+destination is decided deterministically in code rather than by the model; and an
+SLA/paging policy attached from a custom MCP server. **Correct** means: every
+message yields a structured, routable result — never a silent default and never
+free-form text — and anything the agent isn't confident about (confidence below
+0.60, or an unclear/`other` topic) is flagged `needs_human_review` and routed to
+human triage rather than guessed at.
+
+The honest success criterion is therefore *"never drops a message and never fakes
+certainty"* rather than raw accuracy — which is what the confidence gate and the
+forced-`create_ticket` reliability guard exist to guarantee.
+
+---
+
 ## (a) Triage logic
 
 Every message is mapped onto three **closed** enums
