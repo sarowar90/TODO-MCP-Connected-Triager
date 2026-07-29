@@ -43,3 +43,7 @@ app.*.map.json
 /android/app/debug
 /android/app/profile
 /android/app/release
+
+# Capstone agent (Python / Claude Agent SDK)
+agent/.venv/
+__pycache__/
