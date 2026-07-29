@@ -10,7 +10,18 @@ Run:
 
 import asyncio
 
+import os
+
 from fs_policy import INBOX, OUTBOX, REPO_ROOT, check_access, target_path
+
+# A path that is absolute and outside the read root on *both* platforms.
+# A Windows literal like "C:\\Windows\\x" is not absolute under POSIX rules —
+# it is a relative filename, which fs_policy anchors at REPO_ROOT, so it would
+# land *inside* the read root and invert the assertion on Linux.
+OUTSIDE_REPO = str(REPO_ROOT.parent / "outside-the-read-root.txt")
+SYSTEM_FILE = (
+    "C:\\Windows\\System32\\drivers\\etc\\hosts" if os.name == "nt" else "/etc/passwd"
+)
 
 passed = failed = 0
 
@@ -62,7 +73,7 @@ async def main() -> int:
     )
     check(
         "cannot write outside the repo entirely",
-        not allows("Write", "C:\\Windows\\Temp\\escaped.txt"),
+        not allows("Write", OUTSIDE_REPO),
     )
     check(
         "cannot write to a sibling that merely starts with the outbox name",
@@ -83,7 +94,7 @@ async def main() -> int:
     check("can glob inside the repo", allows("Glob", str(REPO_ROOT / "lib")))
     check(
         "cannot read outside the repo",
-        not allows("Read", "C:\\Windows\\System32\\drivers\\etc\\hosts"),
+        not allows("Read", SYSTEM_FILE),
     )
 
     print("\npath extraction")

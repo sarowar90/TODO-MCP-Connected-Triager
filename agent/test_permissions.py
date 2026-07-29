@@ -10,9 +10,17 @@ Run:
 """
 
 import asyncio
+import os
 
 from claude_agent_sdk import PermissionResultDeny
 from fs_policy import OUTBOX, REPO_ROOT
+
+# Absolute and outside the read root on both platforms. A Windows literal is
+# only a relative filename under POSIX rules, so it would resolve *inside* the
+# read root on Linux and invert this assertion.
+SYSTEM_FILE = (
+    "C:\\Windows\\System32\\config\\SAM" if os.name == "nt" else "/etc/passwd"
+)
 from permissions import (
     AUTO_APPROVED_TOOLS,
     CREATE_TICKET,
@@ -198,7 +206,7 @@ async def main() -> int:
     )
     check(
         "read outside the repo",
-        tier_of("Read", {"file_path": "C:\\Windows\\System32\\config\\SAM"}) is Tier.DENY,
+        tier_of("Read", {"file_path": SYSTEM_FILE}) is Tier.DENY,
     )
     check(
         "an unrecognised tool fails closed",
