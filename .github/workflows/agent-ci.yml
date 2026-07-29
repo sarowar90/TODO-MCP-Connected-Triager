@@ -1,0 +1,81 @@
+name: agent
+
+# Runs the agent's offline suite on Linux, on GitHub's runners.
+#
+# This is the first thing in the project that executes anywhere other than the
+# author's Windows laptop, and that is the point: the agent is *deployed* to a
+# Linux container, and several code paths are platform-sensitive — shell-command
+# splitting (`posix=(os.name != "nt")`), path containment, and the read-root
+# derivation that resolves differently under /app. A green run here means the
+# code is not accidentally Windows-only.
+#
+# It does NOT exercise the model: no API key is available to CI, so the agent
+# loop itself is still unverified. See agent/HOSTING.md.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "agent/**"
+      - ".github/workflows/agent-ci.yml"
+  pull_request:
+    paths:
+      - "agent/**"
+      - ".github/workflows/agent-ci.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  offline-suite:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: agent
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: agent/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Byte-compile every module
+        run: python -m compileall -q .
+
+      - name: Offline test suites
+        run: |
+          set -e
+          for suite in test_loop test_fs_policy test_plan test_permissions \
+                       test_checkpoints test_hosting test_skill test_deploy; do
+            echo "::group::$suite"
+            python "$suite.py"
+            echo "::endgroup::"
+          done
+
+      - name: Demonstrations
+        run: |
+          set -e
+          for demo in demo_rollback demo_xlsx demo_skill; do
+            echo "::group::$demo"
+            python "$demo.py"
+            echo "::endgroup::"
+          done
+
+      - name: Preflight (no credentials in CI, so the auth check is expected to fail)
+        continue-on-error: true
+        run: python preflight.py
+
+      - name: Upload the generated workbook
+        uses: actions/upload-artifact@v4
+        with:
+          name: handover-workbook
+          path: agent/workspace/outbox/handover.xlsx
+          if-no-files-found: error

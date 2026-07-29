@@ -47,6 +47,7 @@ Exit codes: `0` success, `1` agent/API failure, `2` no API key set.
 | [`demo_rollback.py`](demo_rollback.py) | Offline demonstration of recovering from a bad change |
 | [`demo_xlsx.py`](demo_xlsx.py) | Offline demonstration that the handover workbook opens and is correct |
 | [`demo_skill.py`](demo_skill.py) | Offline demonstration of the custom skill's workflow |
+| [`preflight.py`](preflight.py) | Production readiness gate — run before deploying |
 | [`skills/`](skills/shift-handover/SKILL.md) | Our own skills — committed |
 | [`vendor-skills/`](vendor-skills/README.md) | Third-party skills — installed locally, gitignored |
 | [`Dockerfile`](Dockerfile) / [`compose.yaml`](compose.yaml) | Container image and hardened run configuration |
@@ -298,6 +299,45 @@ and follows symlinks, so traversal is normalised away rather than pattern-matche
 `Bash` is in `disallowed_tools`: it would be an unguarded write vector sitting
 next to a carefully guarded `Write`.
 
+## Orchestration
+
+Two agent roles with different tool surfaces, not one agent doing everything:
+
+| Role | Denied | Why |
+|---|---|---|
+| **triage** (×N, concurrent) | `Bash`, `Skill` | it classifies; no reason to run a shell or build a document |
+| **handover** (×1, after) | the CRM lookups | it aggregates what is on disk; re-querying could contradict a filed ticket |
+
+Triage messages are independent so they **fan out concurrently**, bounded to
+`MAX_CONCURRENCY = 4` — the SDK spawns one subprocess per session and a wide
+fanout is the documented way to hit rate limits. One agent crashing doesn't take
+the batch down (`return_exceptions=True`).
+
+**Not SDK subagents, deliberately:** subagent file edits aren't tracked by file
+checkpointing, which would void the step-7 rollback guarantee. Each message
+already gets its own session, so the context isolation subagents provide is
+already there. What was missing was concurrency and least privilege.
+
+Concurrency forced one change: **per-step checkpoints are disabled during the
+fan-out**, since concurrent steps share one outbox and restoring one would
+clobber a sibling. The orchestrator takes a single batch checkpoint instead.
+
+## Deployment
+
+```powershell
+.\.venv\Scripts\python.exe preflight.py              # readiness gate, exit 0/1
+.\.venv\Scripts\python.exe preflight.py --check-api  # also prove auth works
+```
+
+[`.github/workflows/agent-ci.yml`](../.github/workflows/agent-ci.yml) runs all
+eight suites and three demos on `ubuntu-latest` — the first thing here that
+executes off a Windows laptop, which matters because several code paths are
+platform-sensitive. It needs no API key and uploads the generated workbook as
+an artifact.
+
+**The agent has not been deployed.** See [`HOSTING.md`](HOSTING.md) for the
+verification-status table and the list of what deployment still needs.
+
 ## Multi-step execution
 
 Running with no arguments triages the **whole inbox**. The goal is decomposed
@@ -363,9 +403,10 @@ drops every other built-in from its context.
 .\.venv\Scripts\python.exe test_checkpoints.py  # 41 checks
 .\.venv\Scripts\python.exe test_hosting.py      # 39 checks
 .\.venv\Scripts\python.exe test_skill.py        # 38 checks
+.\.venv\Scripts\python.exe test_deploy.py       # 50 checks
 ```
 
-254 checks, no network and no API key. They cover the taxonomy validation, the
+304 checks, no network and no API key. They cover the taxonomy validation, the
 confidence gate, each context tool, the goal transitions, plan decomposition
 and sequencing, containment (traversal, absolute paths outside the repo, and a
 sibling directory whose name merely *starts with* `outbox`), and every row of

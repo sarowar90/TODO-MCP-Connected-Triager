@@ -2,12 +2,20 @@
 
 How the agent runs in production, and what each layer actually prevents.
 
-> **Verification status.** Docker is not installed on the machine this was
-> written on, so **the image has never been built or run.** The configuration
-> is checked offline by [`test_hosting.py`](test_hosting.py) (36 checks: the
-> read-root override, COPY sources, hardening directives, context hygiene),
-> but "the config says read-only" is not the same as "the container came up
-> read-only". Treat the build as unverified until you run the commands below.
+> **Verification status — read this first.**
+>
+> | Layer | Status |
+> |---|---|
+> | Offline suite on Linux, off the dev machine | **CI runs it** (`.github/workflows/agent-ci.yml`) |
+> | Container image built or run | **Never.** Docker is not installed here |
+> | Agent loop against the real API | **Never.** No API key has been available |
+> | Deployed to a production environment | **No.** See "What deployment still needs" |
+>
+> `test_hosting.py` and `test_deploy.py` check *configuration*. "The config
+> says read-only" is not "the container came up read-only", and a green CI run
+> proves the code imports and its logic holds on Linux — not that the agent
+> works. Nothing below should be read as a claim that this has run in
+> production.
 
 ## Run it
 
@@ -123,6 +131,94 @@ but two more are needed:
   used to exfiltrate another's data.
 
 Until both exist, run one tenant per container.
+
+## Orchestration
+
+Two agent roles, with deliberately different tool surfaces:
+
+| Role | Has | Denied | Why |
+|---|---|---|---|
+| **triage** (×N, concurrent) | Read/Write/Glob/Grep, CRM lookups, `create_ticket` | `Bash`, `Skill` | it classifies; it has no reason to run a shell or build a document |
+| **handover** (×1, after) | Read/Write/Glob/Grep, `Bash`, `Skill` | the CRM lookups | it aggregates what is already on disk; re-querying the CRM would let it contradict a filed ticket |
+
+Denials are **bare names in `disallowed_tools`**, which removes the tool
+definition from the model's context entirely rather than merely leaving it
+unapproved.
+
+Triage messages are independent, so they fan out concurrently, bounded by a
+semaphore (`MAX_CONCURRENCY = 4`) — the SDK spawns one CLI subprocess per
+session, and a wide fanout is the documented way to hit rate limits. The
+handover step runs after, sequentially, because it consumes their output.
+`asyncio.gather(..., return_exceptions=True)` means one agent crashing does not
+take the batch with it.
+
+### Why not SDK subagents
+
+The SDK can spawn subagents inside one session. Deliberately not used here:
+
+- **Subagent file edits are not tracked by file checkpointing.** That would
+  silently void the rollback guarantee from step 7 — the most valuable safety
+  property in this agent.
+- Subagents inherit the parent's permission mode, which makes per-role least
+  privilege harder to reason about, not easier.
+- Each message already runs in its own session, so the context isolation
+  subagents exist to provide is already there.
+
+What was actually missing was concurrency and least privilege, and neither
+needed subagents.
+
+### Concurrency changed checkpointing
+
+Per-step checkpoints are **disabled during the fan-out**. Concurrent steps
+share one outbox, so per-step snapshots would race and restoring one would
+clobber a sibling's work. The orchestrator takes a single checkpoint around the
+whole batch instead; the sequential handover step keeps its own.
+
+## Deploying
+
+### Continuous integration
+
+`.github/workflows/agent-ci.yml` runs the eight offline suites and the three
+demonstrations on `ubuntu-latest`. This is the first thing in the project that
+executes anywhere other than a Windows laptop, and that is the point: several
+code paths are platform-sensitive — shell splitting (`posix=(os.name != "nt")`),
+path containment, and the read-root derivation that resolves differently under
+`/app`. It uploads the generated workbook as an artifact so the document output
+can be downloaded and opened from a machine that never ran the agent.
+
+CI deliberately needs **no API key**, so it verifies the deterministic half and
+nothing more.
+
+### Preflight
+
+```bash
+python preflight.py              # everything except the model call
+python preflight.py --check-api  # one cheap call proving auth end to end
+```
+
+Run it on the host before running the agent. It checks the runtime, that a
+credential path exists, that the workspace is writable and the read root is not
+`/`, that the policy still denies what it should, and that a skill is present.
+Exit 0/1, so it works as a deploy gate or container healthcheck. It reports
+NOT READY rather than passing when credentials are absent — a preflight that
+always passes is worse than none.
+
+### What deployment still needs
+
+Honest list of what stands between this and production, none of which is done:
+
+| Step | Why it is not done here |
+|---|---|
+| Build and run the image | Docker is not installed on the dev machine |
+| Supply `ANTHROPIC_API_KEY` from a secret manager | No key has been available |
+| Run `preflight.py --check-api` on the host | Same |
+| Run the agent once end to end and read the journal | Same |
+| Put an egress proxy in front of it | Documented above, not implemented |
+| Add a `SessionStore` so transcripts survive restarts | Not implemented |
+| Point OTEL env vars at a collector | Configuration, not code — see below |
+| Schedule it (cron / a queue consumer) | Not implemented |
+
+The first four are a single sitting once a key exists. The rest are real work.
 
 ## Operational gaps
 
