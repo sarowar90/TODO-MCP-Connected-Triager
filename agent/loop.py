@@ -33,7 +33,7 @@ from claude_agent_sdk import (
 )
 
 from checkpoints import CheckpointStore
-from fs_policy import OUTBOX, REPO_ROOT, ensure_workspace
+from fs_policy import OUTBOX, REPO_ROOT, WORKSPACE, ensure_workspace
 from hooks import Journal, build_hooks
 from permissions import (
     AUTO_APPROVED_TOOLS,
@@ -46,6 +46,8 @@ from permissions import (
 from triage_tools import TriageSession, build_triage_server
 
 SPEC_PATH = "lib/triage/triage_spec.md"
+# Per-run CLI config, kept out of ~/.claude so runs cannot share global state.
+CONFIG_DIR = WORKSPACE / ".claude-config"
 OUTBOX_REL = OUTBOX.relative_to(REPO_ROOT).as_posix()
 DIGEST_NAME = "digest.md"
 
@@ -217,6 +219,17 @@ async def _run_once(
         # "default" means nothing is auto-approved beyond allowed_tools, so
         # anything unrecognised reaches the callback and fails closed there.
         permission_mode="default",
+        # Isolation. cwd is the repo root, which carries a CLAUDE.md and a
+        # .claude/ directory meant for *this repo's* contributors, not for a
+        # triage agent. Left at the default, those load into the agent's system
+        # prompt — irrelevant context here, and a cross-tenant leak on a shared
+        # host. Empty setting_sources loads no filesystem settings, and auto
+        # memory has to be disabled separately because it loads regardless.
+        setting_sources=[],
+        env={
+            "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
+            "CLAUDE_CONFIG_DIR": str(CONFIG_DIR),
+        },
         # The SDK's own within-session checkpointing. Cross-step rollback is
         # handled by CheckpointStore, since these checkpoints cannot outlive
         # the session that created them (see checkpoints.py).
