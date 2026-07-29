@@ -17,6 +17,7 @@ is what makes multi-step execution composable rather than bespoke.
 
 import sys
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Any, Callable
 
@@ -38,6 +39,7 @@ from hooks import Journal, build_hooks
 from permissions import (
     AUTO_APPROVED_TOOLS,
     DENIED_TOOLS,
+    LOOKUP_TOOLS,
     Approver,
     DenyApprover,
     PermissionAudit,
@@ -144,6 +146,35 @@ Reference every ticket id exactly as it appears in the files. {OUTBOX_REL}/ is
 the only place you may write. Do not re-classify anything — the filed tickets
 are the source of truth.
 """
+
+
+class Role(str, Enum):
+    """The two agents in this system, and what each is allowed to touch.
+
+    Deliberately *not* SDK subagents. Three reasons:
+      * Subagent file edits are not tracked by file checkpointing, so a
+        subagent could undo the rollback guarantee from step 7.
+      * Subagents inherit the parent's permission mode, which makes the
+        per-role least privilege below harder to reason about, not easier.
+      * Each message already runs in its own session, so the context isolation
+        subagents exist to provide is already there.
+
+    What was actually missing was concurrency and least privilege per role,
+    both of which are handled by the orchestrator in plan.py.
+    """
+
+    TRIAGE = "triage"
+    HANDOVER = "handover"
+
+
+# Least privilege per role: a triage agent has no business running a shell or
+# loading a document skill, and a handover agent has no business querying the
+# CRM. Bare names in disallowed_tools remove the tool definition entirely, so
+# these are removals from the model's context, not just unapproved calls.
+ROLE_DENIED_TOOLS: dict[Role, tuple[str, ...]] = {
+    Role.TRIAGE: ("Bash", "Skill"),
+    Role.HANDOVER: LOOKUP_TOOLS,
+}
 
 
 @dataclass
@@ -307,19 +338,25 @@ async def _run_once(
     permissions: PermissionAudit,
     approver: Approver,
     journal: Journal,
+    role: Role,
 ) -> tuple[str, int, float]:
     """One pass of the SDK's inner loop, with each phase logged."""
+    role_denied = ROLE_DENIED_TOOLS.get(role, ())
     options = ClaudeAgentOptions(
         model=MODEL,
         system_prompt=system_prompt,
         mcp_servers={"triage": build_triage_server(session)},
         # create_ticket is deliberately not pre-approved: leaving it out is what
         # guarantees every ticket reaches can_use_tool and the ASK tier.
-        allowed_tools=AUTO_APPROVED_TOOLS,
+        allowed_tools=[t for t in AUTO_APPROVED_TOOLS if t not in role_denied],
         # Bash and Skill are present only so a document skill can run; both are
         # gated by the policy, and Bash only passes as a confined python call.
-        tools=["Read", "Glob", "Grep", "Write", "Bash", "Skill"],
-        disallowed_tools=list(DENIED_TOOLS),
+        tools=[
+            t
+            for t in ("Read", "Glob", "Grep", "Write", "Bash", "Skill")
+            if t not in role_denied
+        ],
+        disallowed_tools=[*DENIED_TOOLS, *role_denied],
         plugins=_skill_plugins(),
         skills=ENABLED_SKILLS if _skill_plugins() else [],
         # Lifecycle hooks; PreToolUse among them carries the permission policy.
@@ -401,21 +438,27 @@ async def run_step(
     journal: Journal | None = None,
     checkpoints: CheckpointStore | None = None,
     rollback_on_failure: bool = True,
+    role: Role = Role.TRIAGE,
 ) -> StepResult:
     """Run one step to completion: the inner loop plus the retry guard.
 
     A checkpoint is taken *before* the step runs, so a step that fails its goal
     can leave the outbox exactly as it found it rather than half-written.
+
+    Pass `checkpoints=None` when steps run concurrently: per-step snapshots of a
+    shared outbox would race, and restoring one would clobber a sibling's work.
+    The orchestrator takes a single batch checkpoint around the fan-out instead.
     """
     ensure_workspace()
     session = session or TriageSession()
     approver = approver or DenyApprover()
     journal = journal or Journal()
-    checkpoints = checkpoints or CheckpointStore()
     journal.step = name
 
-    before = checkpoints.create(f"before {name}")
-    _log("CKPT", f"{before.id} taken before this step")
+    before = None
+    if checkpoints is not None:
+        before = checkpoints.create(f"before {name}")
+        _log("CKPT", f"{before.id} taken before this step")
 
     attempts = turns = 0
     cost = 0.0
@@ -429,7 +472,7 @@ async def run_step(
             _log("RETRY", f"attempt {attempts}/{MAX_ATTEMPTS}")
 
         subtype, step_turns, step_cost = await _run_once(
-            system_prompt, current_prompt, session, audit, approver, journal
+            system_prompt, current_prompt, session, audit, approver, journal, role
         )
         turns += step_turns
         cost += step_cost
@@ -437,7 +480,8 @@ async def run_step(
         met, reason = goal(session)
         if met:
             return StepResult(
-                name, True, session, attempts, turns, cost, subtype, "", before.id
+                name, True, session, attempts, turns, cost, subtype,
+                "", before.id if before else "",
             )
 
         _log("GOAL", f"not met - {reason}")
@@ -446,13 +490,14 @@ async def run_step(
             f"Complete the task now.\n\n{prompt}"
         )
 
-    if rollback_on_failure:
+    if rollback_on_failure and checkpoints is not None and before is not None:
         report = checkpoints.restore(before.id)
         _log("ROLLBACK", f"{before.id}: {report.describe()}")
         journal.record("checkpoint.restore", f"{before.id} ({report.describe()})")
 
     return StepResult(
-        name, False, session, attempts, turns, cost, subtype, reason, before.id
+        name, False, session, attempts, turns, cost, subtype, reason,
+        before.id if before else "",
     )
 
 

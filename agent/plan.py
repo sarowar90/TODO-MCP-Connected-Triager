@@ -19,9 +19,14 @@ matters for a support queue: one unparseable message should not strand the
 rest of the shift's work.
 """
 
+import asyncio
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
+
+# One CLI subprocess per concurrent session, and a wide fanout is the
+# documented way to hit API rate limits. Four is a starting point, not a law.
+MAX_CONCURRENCY = 4
 
 from checkpoints import CheckpointStore
 from fs_policy import INBOX, REPO_ROOT
@@ -31,6 +36,7 @@ from loop import (
     TRIAGE_SYSTEM_PROMPT,
     WORKBOOK_NAME,
     LoopOutcome,
+    Role,
     StepResult,
     make_deliverable_goal,
     outbox_files,
@@ -129,30 +135,61 @@ async def run_plan(outcome: LoopOutcome, approver=None) -> LoopOutcome:
     plan = build_plan(context.messages)
     plan.render("PLAN (built before any work starts)")
 
-    # --- steps 1..N: triage each message -------------------------------------
-    for index, (source, text) in enumerate(context.messages, start=1):
-        key = f"triage:{source}"
-        plan.set(key, "running")
-        print(f"[step {index}/{len(plan.steps)}] triage {source}")
+    # --- steps 1..N: triage every message, concurrently -----------------------
+    # The messages are independent, so they fan out. Concurrency is bounded:
+    # the SDK spawns one CLI subprocess per session, and a wide fanout is the
+    # documented way to hit API rate limits.
+    batch_checkpoint = checkpoints.create("before the triage batch")
+    print(
+        f"\nfan-out: {len(context.messages)} triage agents, "
+        f"max {MAX_CONCURRENCY} at once  (checkpoint {batch_checkpoint.id})"
+    )
+    for step in plan.steps[:-1]:
+        plan.set(step.key, "running")
 
-        result = await run_step(
-            name=f"triage {source}",
-            system_prompt=TRIAGE_SYSTEM_PROMPT,
-            prompt=f"Triage this support message:\n\n{text}",
-            goal=ticket_goal,
-            audit=outcome.audit,
-            session=TriageSession(),
-            approver=approver,
-            journal=outcome.journal,
-            checkpoints=checkpoints,
-        )
+    limit = asyncio.Semaphore(MAX_CONCURRENCY)
+
+    async def triage_one(source: str, text: str) -> StepResult:
+        async with limit:
+            print(f"  [start] {source}")
+            # checkpoints=None: concurrent steps share one outbox, so per-step
+            # snapshots would race and a per-step restore would clobber a
+            # sibling. The batch checkpoint above covers the whole fan-out.
+            result = await run_step(
+                name=f"triage {source}",
+                system_prompt=TRIAGE_SYSTEM_PROMPT,
+                prompt=f"Triage this support message:\n\n{text}",
+                goal=ticket_goal,
+                audit=outcome.audit,
+                session=TriageSession(),
+                approver=approver,
+                journal=outcome.journal,
+                checkpoints=None,
+                role=Role.TRIAGE,
+            )
+            print(f"  [done ] {source}: {'ok' if result.goal_met else 'FAILED'}")
+            return result
+
+    results = await asyncio.gather(
+        *(triage_one(source, text) for source, text in context.messages),
+        return_exceptions=True,
+    )
+
+    for (source, _), result in zip(context.messages, results):
+        key = f"triage:{source}"
+        if isinstance(result, BaseException):
+            # One agent raising must not take the batch down with it.
+            plan.set(key, "failed", f"raised {type(result).__name__}: {result}")
+            outcome.journal.record("step.crashed", f"{source}: {result}")
+            continue
+
         outcome.steps.append(result)
         context.results.append(result)
 
         if result.goal_met and result.session.ticket:
-            ticket_id = result.session.ticket.get("ticket_id", "")
-            context.ticket_ids.append(ticket_id)
             ticket = result.session.ticket
+            ticket_id = ticket.get("ticket_id", "")
+            context.ticket_ids.append(ticket_id)
             plan.set(
                 key,
                 "done",
@@ -161,10 +198,6 @@ async def run_plan(outcome: LoopOutcome, approver=None) -> LoopOutcome:
         else:
             # Keep going: one bad message must not strand the rest of the queue.
             plan.set(key, "failed", result.reason)
-            if result.checkpoint_id:
-                outcome.rolled_back.append(
-                    f"{result.name} -> rolled back to {result.checkpoint_id}"
-                )
 
     # --- step N+1: aggregate, using the intermediate results ------------------
     if not context.ticket_ids:
@@ -190,6 +223,7 @@ async def run_plan(outcome: LoopOutcome, approver=None) -> LoopOutcome:
         approver=approver,
         journal=outcome.journal,
         checkpoints=checkpoints,
+        role=Role.HANDOVER,
     )
     outcome.steps.append(digest_result)
     plan.set(
