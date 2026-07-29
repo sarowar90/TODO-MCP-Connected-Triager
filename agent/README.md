@@ -48,6 +48,7 @@ Exit codes: `0` success, `1` agent/API failure, `2` no API key set.
 | [`demo_xlsx.py`](demo_xlsx.py) | Offline demonstration that the handover workbook opens and is correct |
 | [`demo_skill.py`](demo_skill.py) | Offline demonstration of the custom skill's workflow |
 | [`preflight.py`](preflight.py) | Production readiness gate — run before deploying |
+| [`runner.py`](runner.py) | Production entrypoint: lock, signals, JSON logs, exit codes |
 | [`skills/`](skills/shift-handover/SKILL.md) | Our own skills — committed |
 | [`vendor-skills/`](vendor-skills/README.md) | Third-party skills — installed locally, gitignored |
 | [`Dockerfile`](Dockerfile) / [`compose.yaml`](compose.yaml) | Container image and hardened run configuration |
@@ -324,10 +325,30 @@ clobber a sibling. The orchestrator takes a single batch checkpoint instead.
 
 ## Deployment
 
+`agent.py` is the interactive CLI. **`runner.py` is what a scheduler or a
+container entrypoint should call**, because unattended execution needs four
+things the interactive path doesn't:
+
+- **a single-instance lock** — batches share one outbox, and cron will happily
+  start a second run while the first is going; overlapping runs interleave
+  writes into the same ticket files. A lock held by a dead process is
+  reclaimed, so one crash doesn't wedge the schedule forever;
+- **graceful SIGTERM** — a container stop finishes the step in flight instead
+  of dying mid-write; a second signal exits immediately;
+- **JSON logs on stdout** — nothing reads a pretty console in production;
+- **exit codes a scheduler can branch on**: `0` done, `1` goal not met, `69`
+  unavailable, `70` internal error, `75` another run holds the lock (retry
+  later), `78` environment unfit.
+
 ```powershell
-.\.venv\Scripts\python.exe preflight.py              # readiness gate, exit 0/1
+.\.venv\Scripts\python.exe runner.py                 # preflight, then the batch
+.\.venv\Scripts\python.exe preflight.py              # readiness gate alone
 .\.venv\Scripts\python.exe preflight.py --check-api  # also prove auth works
 ```
+
+`preflight.py` is also the container `HEALTHCHECK`, so the container goes
+unhealthy if credentials are revoked, the outbox stops being writable, or the
+policy is edited open.
 
 [`.github/workflows/agent-ci.yml`](../.github/workflows/agent-ci.yml) runs all
 eight suites and three demos on `ubuntu-latest` — the first thing here that
@@ -404,9 +425,10 @@ drops every other built-in from its context.
 .\.venv\Scripts\python.exe test_hosting.py      # 39 checks
 .\.venv\Scripts\python.exe test_skill.py        # 38 checks
 .\.venv\Scripts\python.exe test_deploy.py       # 50 checks
+.\.venv\Scripts\python.exe test_runner.py       # 32 checks
 ```
 
-304 checks, no network and no API key. They cover the taxonomy validation, the
+338 checks, no network and no API key. They cover the taxonomy validation, the
 confidence gate, each context tool, the goal transitions, plan decomposition
 and sequencing, containment (traversal, absolute paths outside the repo, and a
 sibling directory whose name merely *starts with* `outbox`), and every row of

@@ -106,7 +106,9 @@ def main() -> int:
     check("the read root is pinned for the container", "AGENT_REPO_ROOT=/app" in dockerfile)
     check("auto memory is disabled", "CLAUDE_CODE_DISABLE_AUTO_MEMORY=1" in dockerfile)
     check("the CLI config dir is per-container", "CLAUDE_CONFIG_DIR=/app/workspace" in dockerfile)
-    check("the default approval mode is deny", '"--approve=deny"' in dockerfile)
+    check("the entrypoint is the production runner", '"runner.py"' in dockerfile)
+    check("a healthcheck is defined", "HEALTHCHECK" in dockerfile)
+    check("the healthcheck uses preflight", "preflight.py" in dockerfile)
     # Mentioning the variable in a comment is fine; assigning it is not. Look
     # for an actual ENV/ARG assignment rather than any occurrence of the name.
     baked = re.search(

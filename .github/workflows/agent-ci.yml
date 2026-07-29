@@ -54,7 +54,8 @@ jobs:
         run: |
           set -e
           for suite in test_loop test_fs_policy test_plan test_permissions \
-                       test_checkpoints test_hosting test_skill test_deploy; do
+                       test_checkpoints test_hosting test_skill test_deploy \
+                       test_runner; do
             echo "::group::$suite"
             python "$suite.py"
             echo "::endgroup::"

@@ -52,7 +52,13 @@ ENV PYTHONUNBUFFERED=1 \
     CLAUDE_CODE_DISABLE_AUTO_MEMORY=1 \
     CLAUDE_CONFIG_DIR=/app/workspace/.claude-config
 
-# Unattended by default: refuse anything needing a human rather than silently
-# paging on-call. Override at run time for an interactive operator.
-ENTRYPOINT ["python", "agent.py"]
-CMD ["--approve=deny"]
+# Fails the container as unhealthy if the environment stops being fit to run —
+# credentials revoked, outbox unwritable, policy edited open.
+HEALTHCHECK --interval=5m --timeout=60s --start-period=15s --retries=2 \
+    CMD ["python", "preflight.py"]
+
+# runner.py, not agent.py: unattended execution needs the single-instance lock,
+# SIGTERM handling, JSON logs and scheduler-readable exit codes. agent.py stays
+# the interactive CLI — override the entrypoint to use it.
+ENTRYPOINT ["python", "runner.py"]
+CMD []

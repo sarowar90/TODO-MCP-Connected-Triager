@@ -216,7 +216,7 @@ Honest list of what stands between this and production, none of which is done:
 | Put an egress proxy in front of it | Documented above, not implemented |
 | Add a `SessionStore` so transcripts survive restarts | Not implemented |
 | Point OTEL env vars at a collector | Configuration, not code — see below |
-| Schedule it (cron / a queue consumer) | Not implemented |
+| Schedule it (cron / a queue consumer) | `runner.py` is the entrypoint for one; the schedule itself is not configured |
 
 The first four are a single sitting once a key exists. The rest are real work.
 

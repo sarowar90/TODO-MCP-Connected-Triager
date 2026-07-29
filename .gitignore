@@ -62,3 +62,4 @@ agent/workspace/.test-checkpoints/
 # Anthropic's document skills are source-available rather than open source.
 agent/vendor-skills/*
 !agent/vendor-skills/README.md
+agent/workspace/.runner.lock
