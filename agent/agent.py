@@ -87,8 +87,13 @@ async def run_single(message: str, source: str, approver) -> LoopOutcome:
         audit=outcome.audit,
         session=TriageSession(),
         approver=approver,
+        journal=outcome.journal,
     )
     outcome.steps.append(result)
+    if not result.goal_met and result.checkpoint_id:
+        outcome.rolled_back.append(
+            f"{result.name} -> rolled back to {result.checkpoint_id}"
+        )
     outcome.written_files = outbox_files("*.md")
     return outcome
 

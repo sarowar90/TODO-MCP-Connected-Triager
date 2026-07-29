@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
+from checkpoints import CheckpointStore
 from fs_policy import INBOX, REPO_ROOT
 from loop import (
     DIGEST_NAME,
@@ -110,6 +111,8 @@ def build_plan(messages: list[tuple[str, str]]) -> Plan:
 
 async def run_plan(outcome: LoopOutcome, approver=None) -> LoopOutcome:
     """Execute the plan in sequence, carrying intermediate results forward."""
+    checkpoints = CheckpointStore()
+    checkpoints.clear()  # each run starts its own checkpoint history
     context = PlanContext(messages=load_inbox())
 
     if not context.messages:
@@ -135,6 +138,8 @@ async def run_plan(outcome: LoopOutcome, approver=None) -> LoopOutcome:
             audit=outcome.audit,
             session=TriageSession(),
             approver=approver,
+            journal=outcome.journal,
+            checkpoints=checkpoints,
         )
         outcome.steps.append(result)
         context.results.append(result)
@@ -151,6 +156,10 @@ async def run_plan(outcome: LoopOutcome, approver=None) -> LoopOutcome:
         else:
             # Keep going: one bad message must not strand the rest of the queue.
             plan.set(key, "failed", result.reason)
+            if result.checkpoint_id:
+                outcome.rolled_back.append(
+                    f"{result.name} -> rolled back to {result.checkpoint_id}"
+                )
 
     # --- step N+1: aggregate, using the intermediate results ------------------
     if not context.ticket_ids:
@@ -174,6 +183,8 @@ async def run_plan(outcome: LoopOutcome, approver=None) -> LoopOutcome:
         audit=outcome.audit,
         session=TriageSession(),
         approver=approver,
+        journal=outcome.journal,
+        checkpoints=checkpoints,
     )
     outcome.steps.append(digest_result)
     plan.set(
@@ -181,6 +192,13 @@ async def run_plan(outcome: LoopOutcome, approver=None) -> LoopOutcome:
         "done" if digest_result.goal_met else "failed",
         "" if digest_result.goal_met else digest_result.reason,
     )
+    if not digest_result.goal_met and digest_result.checkpoint_id:
+        # This is the case SDK checkpoints cannot cover: the digest step ran in
+        # its own session, so only the workspace checkpoint can undo damage it
+        # did to tickets the earlier steps produced.
+        outcome.rolled_back.append(
+            f"{digest_result.name} -> rolled back to {digest_result.checkpoint_id}"
+        )
 
     plan.render("PLAN (final)")
     outcome.written_files = outbox_files("*.md")

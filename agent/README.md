@@ -42,6 +42,9 @@ Exit codes: `0` success, `1` agent/API failure, `2` no API key set.
 | [`loop.py`](loop.py) | The step runner — phase instrumentation, goal check, retry |
 | [`triage_tools.py`](triage_tools.py) | The four custom tools + the closed taxonomy and validation |
 | [`permissions.py`](permissions.py) | The permission strategy: tiers, enforcement, approvers |
+| [`hooks.py`](hooks.py) | Lifecycle hooks and the run journal |
+| [`checkpoints.py`](checkpoints.py) | Workspace snapshots and rollback |
+| [`demo_rollback.py`](demo_rollback.py) | Offline demonstration of recovering from a bad change |
 | [`fs_policy.py`](fs_policy.py) | Filesystem roots and path containment checks |
 | [`test_loop.py`](test_loop.py) | Offline checks of the tools and goal logic (21) |
 | [`test_fs_policy.py`](test_fs_policy.py) | Offline checks of path containment (25) |
@@ -49,6 +52,61 @@ Exit codes: `0` success, `1` agent/API failure, `2` no API key set.
 | [`test_permissions.py`](test_permissions.py) | Offline checks of every policy row and both enforcement points (37) |
 | `workspace/inbox/` | Input: support messages the agent reads |
 | `workspace/outbox/` | Output: filed tickets the agent writes (gitignored) |
+
+## Checkpointing and rollback
+
+```powershell
+.\.venv\Scripts\python.exe demo_rollback.py   # offline, no API key
+```
+
+`run_step` takes a checkpoint of the outbox **before** each step, so a step
+that fails its goal leaves the outbox exactly as it found it rather than
+half-written. [`demo_rollback.py`](demo_rollback.py) shows recovery from a
+deliberately bad change: a later step overwrites one ticket with garbage,
+deletes another, and writes a wrong digest. The restore rewrites the corrupted
+file, recreates the deleted one, and removes the file that was added after the
+snapshot — verified by re-checking drift, which comes back empty.
+
+### Why not just the SDK's checkpointing
+
+The SDK tracks `Write`/`Edit`/`NotebookEdit` and can `rewind_files()` to a
+checkpoint UUID. Two properties make it insufficient **on its own here**:
+
+- **Checkpoints are tied to the session that created them.** This agent runs
+  *one session per step*, so a checkpoint from triaging message 1 cannot be
+  rewound from the digest step's session. The single most valuable rollback —
+  "the digest step trashed the tickets the earlier steps produced" — spans
+  sessions, and is precisely what the SDK's mechanism cannot reach.
+- **File content only.** Creating and deleting files is not fully undone.
+
+So `enable_file_checkpointing=True` is set (with
+`extra_args={"replay-user-messages": None}`, which is what makes the UUIDs
+appear) and the first user-message UUID is captured per step for *within*-step
+rewind, while [`checkpoints.py`](checkpoints.py) covers the whole run. They are
+complementary. **Caveat:** calling `rewind_files()` requires `ClaudeSDKClient`,
+and this loop uses `query()` — so the SDK-side restore path is enabled and
+captured but not yet invoked. The workspace store is what actually performs
+rollbacks today.
+
+## Lifecycle hooks
+
+[`hooks.py`](hooks.py) wires six events to one journal — the run's audit trail,
+and what you read after an unattended batch to find out why the outbox looks
+the way it does. Hooks run in your process, not the agent's context window, so
+they cost no tokens.
+
+| Hook | Purpose |
+|---|---|
+| `UserPromptSubmit` | a step begins — open a journal entry |
+| `PreToolUse` | the permission decision (see below) **and** journal it |
+| `PostToolUse` | record the call; flag file mutations |
+| `PostToolUseFailure` | record tool errors |
+| `PreCompact` | note compaction, which can drop detail from the transcript |
+| `Stop` | the step finished — close the entry |
+
+`PreToolUse` carries the permission policy as well as journalling, because a
+single `PreToolUse` hook has to return the permission decision — splitting it
+would leave one hook returning `{}` and muddy where the verdict comes from.
 
 ## Permission strategy
 
@@ -196,18 +254,24 @@ drops every other built-in from its context.
 .\.venv\Scripts\python.exe test_fs_policy.py    # 25 checks
 .\.venv\Scripts\python.exe test_plan.py         # 22 checks
 .\.venv\Scripts\python.exe test_permissions.py  # 37 checks
+.\.venv\Scripts\python.exe test_checkpoints.py  # 41 checks
 ```
 
-105 checks, no network and no API key. They cover the taxonomy validation, the
+146 checks, no network and no API key. They cover the taxonomy validation, the
 confidence gate, each context tool, the goal transitions, plan decomposition
 and sequencing, containment (traversal, absolute paths outside the repo, and a
 sibling directory whose name merely *starts with* `outbox`), and every row of
 the permission table above — including that an auto-approver still cannot grant
-a denied tool.
+a denied tool — plus checkpoint snapshot/restore/drift and every lifecycle hook.
 
-**What they cannot cover is the live agent run.** Every goal check, hook, and
-plan transition here is verified against synthetic inputs; none of it has yet
-been exercised by the model actually driving the SDK. That needs a key.
+Checkpoint rollback is additionally **demonstrated end to end** by
+[`demo_rollback.py`](demo_rollback.py), which needs no key: it is the one part
+of this agent whose behaviour has actually been observed rather than asserted.
+
+**What the tests cannot cover is the live agent run.** Every goal check, hook,
+permission tier, and plan transition here is verified against synthetic inputs;
+none of it has yet been exercised by the model actually driving the SDK. That
+needs a key.
 
 ## Notes for later steps
 

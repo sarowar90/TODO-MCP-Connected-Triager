@@ -23,7 +23,6 @@ from typing import Any, Callable
 from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
-    HookMatcher,
     ResultMessage,
     SystemMessage,
     TextBlock,
@@ -33,7 +32,9 @@ from claude_agent_sdk import (
     query,
 )
 
+from checkpoints import CheckpointStore
 from fs_policy import OUTBOX, REPO_ROOT, ensure_workspace
+from hooks import Journal, build_hooks
 from permissions import (
     AUTO_APPROVED_TOOLS,
     DENIED_TOOLS,
@@ -41,7 +42,6 @@ from permissions import (
     DenyApprover,
     PermissionAudit,
     make_can_use_tool,
-    make_permission_hook,
 )
 from triage_tools import TriageSession, build_triage_server
 
@@ -110,6 +110,7 @@ class StepResult:
     cost_usd: float
     stopped_because: str
     reason: str = ""
+    checkpoint_id: str = ""
 
 
 @dataclass
@@ -118,8 +119,10 @@ class LoopOutcome:
 
     steps: list[StepResult] = field(default_factory=list)
     audit: PermissionAudit = field(default_factory=PermissionAudit)
+    journal: Journal = field(default_factory=Journal)
     written_files: list[Path] = field(default_factory=list)
     approver_name: str = DenyApprover.name
+    rolled_back: list[str] = field(default_factory=list)
 
     @property
     def goal_met(self) -> bool:
@@ -195,6 +198,7 @@ async def _run_once(
     session: TriageSession,
     permissions: PermissionAudit,
     approver: Approver,
+    journal: Journal,
 ) -> tuple[str, int, float]:
     """One pass of the SDK's inner loop, with each phase logged."""
     options = ClaudeAgentOptions(
@@ -206,17 +210,24 @@ async def _run_once(
         allowed_tools=AUTO_APPROVED_TOOLS,
         tools=["Read", "Glob", "Grep", "Write"],
         disallowed_tools=list(DENIED_TOOLS),
-        # No matcher: the policy sees every tool call, not just file tools.
-        hooks={"PreToolUse": [HookMatcher(hooks=[make_permission_hook(permissions)])]},
+        # Lifecycle hooks; PreToolUse among them carries the permission policy.
+        # No matchers, so the policy sees every tool call, not just file tools.
+        hooks=build_hooks(journal, permissions),
         can_use_tool=make_can_use_tool(approver, permissions),
         # "default" means nothing is auto-approved beyond allowed_tools, so
         # anything unrecognised reaches the callback and fails closed there.
         permission_mode="default",
+        # The SDK's own within-session checkpointing. Cross-step rollback is
+        # handled by CheckpointStore, since these checkpoints cannot outlive
+        # the session that created them (see checkpoints.py).
+        enable_file_checkpointing=True,
+        extra_args={"replay-user-messages": None},
         cwd=str(REPO_ROOT),
         max_turns=MAX_TURNS,
     )
 
     subtype, turns, cost = "no_result", 0, 0.0
+    sdk_checkpoint: str | None = None
 
     # Iterate to completion rather than breaking on ResultMessage: trailing
     # system events can follow it. query() then raises by design once an error
@@ -235,6 +246,10 @@ async def _run_once(
                         _log("ACT", f"{name}({_short(block.input, 60)})")
 
             elif isinstance(msg, UserMessage):
+                # With replay-user-messages set, each user message uuid is an
+                # SDK restore point valid inside this session.
+                if getattr(msg, "uuid", None) and not sdk_checkpoint:
+                    sdk_checkpoint = msg.uuid
                 for block in msg.content:
                     if isinstance(block, ToolResultBlock):
                         flag = "rejected " if block.is_error else ""
@@ -260,11 +275,25 @@ async def run_step(
     audit: PermissionAudit,
     session: TriageSession | None = None,
     approver: Approver | None = None,
+    journal: Journal | None = None,
+    checkpoints: CheckpointStore | None = None,
+    rollback_on_failure: bool = True,
 ) -> StepResult:
-    """Run one step to completion: the inner loop plus the retry guard."""
+    """Run one step to completion: the inner loop plus the retry guard.
+
+    A checkpoint is taken *before* the step runs, so a step that fails its goal
+    can leave the outbox exactly as it found it rather than half-written.
+    """
     ensure_workspace()
     session = session or TriageSession()
     approver = approver or DenyApprover()
+    journal = journal or Journal()
+    checkpoints = checkpoints or CheckpointStore()
+    journal.step = name
+
+    before = checkpoints.create(f"before {name}")
+    _log("CKPT", f"{before.id} taken before this step")
+
     attempts = turns = 0
     cost = 0.0
     subtype = "no_result"
@@ -277,14 +306,16 @@ async def run_step(
             _log("RETRY", f"attempt {attempts}/{MAX_ATTEMPTS}")
 
         subtype, step_turns, step_cost = await _run_once(
-            system_prompt, current_prompt, session, audit, approver
+            system_prompt, current_prompt, session, audit, approver, journal
         )
         turns += step_turns
         cost += step_cost
 
         met, reason = goal(session)
         if met:
-            return StepResult(name, True, session, attempts, turns, cost, subtype)
+            return StepResult(
+                name, True, session, attempts, turns, cost, subtype, "", before.id
+            )
 
         _log("GOAL", f"not met - {reason}")
         current_prompt = (
@@ -292,7 +323,14 @@ async def run_step(
             f"Complete the task now.\n\n{prompt}"
         )
 
-    return StepResult(name, False, session, attempts, turns, cost, subtype, reason)
+    if rollback_on_failure:
+        report = checkpoints.restore(before.id)
+        _log("ROLLBACK", f"{before.id}: {report.describe()}")
+        journal.record("checkpoint.restore", f"{before.id} ({report.describe()})")
+
+    return StepResult(
+        name, False, session, attempts, turns, cost, subtype, reason, before.id
+    )
 
 
 def report(outcome: LoopOutcome) -> int:
@@ -324,6 +362,17 @@ def report(outcome: LoopOutcome) -> int:
         print(f"    wrote   {path.relative_to(REPO_ROOT).as_posix()}")
     if not outcome.written_files:
         print("    wrote   (nothing)")
+
+    if outcome.rolled_back:
+        print("\n  rollbacks")
+        for note in outcome.rolled_back:
+            print(f"    {note}")
+
+    if outcome.journal.entries:
+        print(f"\n  journal  ({len(outcome.journal.entries)} events, last 8)")
+        outcome.journal.render(limit=8)
+        if outcome.journal.compactions:
+            print(f"    context was compacted {outcome.journal.compactions}x")
 
     print(f"\n  permissions  (approver: {outcome.approver_name})")
     for tool, reason, granted in outcome.audit.asked:
