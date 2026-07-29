@@ -47,8 +47,11 @@ interactive operator gets `PromptApprover`; `AutoApprover` exists for tests and
 must be opted into explicitly.
 """
 
+import os
+import shlex
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import PurePosixPath
 from typing import Any, Protocol
 
 from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
@@ -72,7 +75,6 @@ PAGING_URGENCIES = ("urgent",)
 
 # Never available, whatever else is configured.
 DENIED_TOOLS = (
-    "Bash",
     "BashOutput",
     "KillShell",
     "WebFetch",
@@ -81,6 +83,23 @@ DENIED_TOOLS = (
     "Task",
     "Agent",
 )
+
+# --- Bash, narrowly ----------------------------------------------------------
+# Step 6 denied Bash outright, as an unguarded write vector sitting next to a
+# carefully guarded Write. The xlsx skill changes that calculation: a document
+# skill generates its file by running Python, so denying Bash denies the skill.
+#
+# Rather than drop the denial, Bash is admitted through an allowlist:
+#   * the command must invoke the interpreter, nothing else;
+#   * no shell metacharacters, so one approved command cannot smuggle a second;
+#   * every filesystem-looking argument must sit inside the outbox.
+# Anything failing those is denied exactly as before. A blocklist would not be
+# sufficient here — this is an allowlist, and unrecognised shapes fail closed.
+BASH_ALLOWED_PROGRAMS = ("python", "python3")
+
+# Chaining, substitution, redirection: each turns one vetted command into an
+# arbitrary one, so their mere presence is disqualifying.
+SHELL_METACHARACTERS = (";", "&&", "||", "|", "`", "$(", ">", "<", "\n", "&")
 
 
 class Tier(str, Enum):
@@ -115,16 +134,78 @@ def classify(tool_name: str, tool_input: dict[str, Any]) -> Decision:
             return Decision(Tier.AUTO, reason)
         return Decision(Tier.AUTO, "no filesystem target")
 
-    # 3. Read-only context lookups.
+    # 3. Bash, only in the narrow shape a document skill needs.
+    if tool_name == "Bash":
+        return _classify_bash(str((tool_input or {}).get("command", "")))
+
+    # 4. Read-only context lookups, and invoking a skill. Invoking a skill is
+    # itself harmless — it loads instructions. What the skill then *does* is
+    # re-checked here call by call, so a skill cannot widen its own access.
     if tool_name in LOOKUP_TOOLS:
         return Decision(Tier.AUTO, "read-only context lookup")
+    if tool_name == "Skill":
+        return Decision(Tier.AUTO, "loading a skill; its actions are re-checked")
 
-    # 4. The consequential action: filing and routing a ticket.
+    # 5. The consequential action: filing and routing a ticket.
     if tool_name == CREATE_TICKET:
         return _classify_ticket(tool_input)
 
-    # 5. Anything unrecognised fails closed rather than open.
+    # 6. Anything unrecognised fails closed rather than open.
     return Decision(Tier.DENY, f"{tool_name} is not part of the agent's tool surface")
+
+
+def _classify_bash(command: str) -> Decision:
+    """Admit only `python <args>` with no shell tricks and no paths outside the
+    outbox. Everything else is denied, as it was before the skill existed."""
+    stripped = command.strip()
+    if not stripped:
+        return Decision(Tier.DENY, "empty bash command")
+
+    for meta in SHELL_METACHARACTERS:
+        if meta in stripped:
+            return Decision(
+                Tier.DENY,
+                f"bash command contains {meta!r}; only a single plain "
+                f"{'/'.join(BASH_ALLOWED_PROGRAMS)} invocation is permitted",
+            )
+
+    # Split the way the host shell would. posix=True treats a backslash as an
+    # escape, which mangles Windows paths into something that then fails the
+    # containment check for the wrong reason; posix=False keeps them intact.
+    try:
+        parts = shlex.split(stripped, posix=(os.name != "nt"))
+    except ValueError as exc:
+        return Decision(Tier.DENY, f"bash command does not parse: {exc}")
+    parts = [p.strip('"').strip("'") for p in parts]
+    if not parts:
+        return Decision(Tier.DENY, "empty bash command")
+
+    program = PurePosixPath(parts[0]).name
+    if program not in BASH_ALLOWED_PROGRAMS:
+        return Decision(
+            Tier.DENY,
+            f"{program!r} is not an allowed program; only "
+            f"{'/'.join(BASH_ALLOWED_PROGRAMS)} may be run",
+        )
+
+    # Any argument that looks like a path must live inside the outbox. `-c`
+    # inline scripts are rejected outright: their contents are not inspectable
+    # as paths, so they could write anywhere the process can reach.
+    for arg in parts[1:]:
+        if arg == "-c":
+            return Decision(
+                Tier.DENY,
+                "inline `python -c` is not permitted; the skill must run a "
+                "script file inside the outbox",
+            )
+        if arg.startswith("-"):
+            continue
+        if "/" in arg or "\\" in arg or arg.endswith((".py", ".xlsx", ".csv")):
+            ok, reason = check_access("Write", {"file_path": arg})
+            if not ok:
+                return Decision(Tier.DENY, f"bash argument {arg!r}: {reason}")
+
+    return Decision(Tier.AUTO, "python invocation confined to the outbox")
 
 
 def _classify_ticket(args: dict[str, Any]) -> Decision:
@@ -292,4 +373,4 @@ def make_can_use_tool(approver: Approver, audit: PermissionAudit):
 # Tools pre-approved in `allowed_tools`. create_ticket is deliberately absent:
 # leaving it out guarantees every ticket reaches can_use_tool, so the ASK tier
 # is enforced by the callback and does not depend on hook `ask` semantics.
-AUTO_APPROVED_TOOLS = ["Read", "Glob", "Grep", "Write", *LOOKUP_TOOLS]
+AUTO_APPROVED_TOOLS = ["Read", "Glob", "Grep", "Write", "Skill", *LOOKUP_TOOLS]

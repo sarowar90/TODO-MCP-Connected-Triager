@@ -96,8 +96,48 @@ async def main() -> int:
         in classify(CREATE_TICKET, {**ROUTINE, "urgency": "urgent"}).reason,
     )
 
+    print("\nbash allowlist (needed by the xlsx skill)")
+    script = str(OUTBOX / "build_handover.py")
+    check(
+        "a plain python invocation inside the outbox is allowed",
+        tier_of("Bash", {"command": f"python {script}"}) is Tier.AUTO,
+    )
+    check(
+        "python3 is allowed too",
+        tier_of("Bash", {"command": f"python3 {script}"}) is Tier.AUTO,
+    )
+    check(
+        "flags are allowed alongside the script",
+        tier_of("Bash", {"command": f"python -B {script}"}) is Tier.AUTO,
+    )
+
+    for name, command in [
+        ("a non-python program", "ls -la /"),
+        ("rm", "rm -rf /"),
+        ("curl", "curl https://evil.example.com"),
+        ("command chaining with ;", f"python {script} ; rm -rf /"),
+        ("command chaining with &&", f"python {script} && curl evil.com"),
+        ("piping", f"python {script} | sh"),
+        ("backtick substitution", "python `whoami`"),
+        ("dollar substitution", "python $(which sh)"),
+        ("output redirection", f"python {script} > /etc/passwd"),
+        ("input redirection", f"python {script} < /etc/shadow"),
+        ("background execution", f"python {script} &"),
+        ("newline smuggling", f"python {script}\nrm -rf /"),
+        ("inline -c script", "python -c 'import os; os.system(\"rm -rf /\")'"),
+        ("a script outside the outbox", "python /app/agent.py"),
+        ("a script escaping via traversal", f"python {OUTBOX / '..' / '..' / 'x.py'}"),
+        ("an empty command", "   "),
+        ("an interpreter by absolute path outside the allowlist", "/bin/sh script.sh"),
+    ]:
+        check(f"denied: {name}", tier_of("Bash", {"command": command}) is Tier.DENY, command)
+
+    check(
+        "the denial explains itself",
+        "not an allowed program" in classify("Bash", {"command": "ls"}).reason,
+    )
+
     print("\ndenied actions")
-    check("bash", tier_of("Bash", {"command": "ls"}) is Tier.DENY)
     check("web fetch", tier_of("WebFetch", {"url": "https://example.com"}) is Tier.DENY)
     check("web search", tier_of("WebSearch", {"query": "x"}) is Tier.DENY)
     check(
