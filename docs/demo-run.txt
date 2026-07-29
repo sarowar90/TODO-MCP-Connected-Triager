@@ -1,0 +1,248 @@
+SUPPORT TRIAGER — DEMO DAY RUN
+recorded  2026-07-29T15:15:38+00:00
+python    3.12.10
+mode      OFFLINE — no API key present
+
+NOTE: ANTHROPIC_API_KEY is not set, so the agent loop is NOT
+exercised in this transcript. What follows demonstrates the
+deterministic parts: checkpoint rollback, the document output,
+and the custom skill's workflow. Set the key and re-run to
+produce a live end-to-end transcript.
+
+==========================================================================
+PREFLIGHT
+--------------------------------------------------------------------------
+Readiness gate. Expected to report NOT READY without a key.
+==========================================================================
+
+==================================================================
+PREFLIGHT
+==================================================================
+
+runtime
+
+credentials
+
+workspace
+
+permission policy
+
+skills
+
+model reachability
+  skipped â€” pass --check-api to spend one call proving auth
+
+==================================================================
+  [ok  ] python 3.12 meets the 3.10+ floor
+  [ok  ] claude-agent-sdk importable
+  [ok  ] openpyxl importable (needed for the workbook)
+  [FAIL] an auth path is configured  â€” set ANTHROPIC_API_KEY, or ANTHROPIC_BASE_URL to route via a proxy
+  [ok  ] workspace importable and creatable
+  [ok  ] read root is not the filesystem root
+  [ok  ] inbox exists
+  [ok  ] outbox exists
+  [ok  ] outbox is writable
+  [ok  ] inbox has at least one message
+  [ok  ] at least 200 MB free disk
+  [ok  ] policy importable
+  [ok  ] writes outside the outbox are denied
+  [ok  ] writes inside the outbox are allowed
+  [ok  ] arbitrary shell is denied
+  [ok  ] unknown tools fail closed
+  [ok  ] urgent tickets still require approval
+  [ok  ] skill loader importable
+  [ok  ] the shift-handover skill is present
+  [ok  ] at least one skill root is populated
+==================================================================
+NOT READY â€” 1 check(s) failed
+
+preflight exit code: 1  (78/1 expected without credentials)
+
+==========================================================================
+CHECKPOINT ROLLBACK
+--------------------------------------------------------------------------
+A later step corrupts one ticket, deletes another and writes a bad digest; the run rolls back to the pre-step checkpoint and every change is undone.
+==========================================================================
+
+
+====================================================================
+1. EARLIER STEPS PRODUCE GOOD WORK
+====================================================================
+  two triage steps filed their tickets
+
+  outbox after triage:
+    TICK-5001.md           199 bytes  # TICK-5001
+    TICK-5002.md           199 bytes  # TICK-5002
+
+====================================================================
+2. CHECKPOINT TAKEN BEFORE THE NEXT STEP
+====================================================================
+  cp01-151539  before digest step  (2 file(s))
+    TICK-5001.md         sha256:5e3b06d3912085e5â€¦
+    TICK-5002.md         sha256:38a008948812343câ€¦
+
+====================================================================
+3. THE DIGEST STEP GOES WRONG
+====================================================================
+  overwrote TICK-5001.md with garbage
+  deleted TICK-5002.md entirely
+  wrote a bad digest.md
+
+  outbox after the bad step:
+    digest.md               69 bytes  # Handover
+    TICK-5001.md            57 bytes  CORRUPTED - the step overwrote this ticket with garbage
+
+  drift detected against the checkpoint:
+    modified  TICK-5001.md
+    deleted   TICK-5002.md
+    added     digest.md
+
+====================================================================
+4. ROLL BACK
+====================================================================
+  restored to cp01-151539: 1 restored, 1 recreated, 1 removed
+    rewritten  TICK-5001.md
+    recreated  TICK-5002.md
+    removed    digest.md
+
+  outbox after rollback:
+    TICK-5001.md           199 bytes  # TICK-5001
+    TICK-5002.md           199 bytes  # TICK-5002
+
+====================================================================
+5. VERIFY
+====================================================================
+
+  PASS  TICK-5001 content is back
+  PASS  TICK-5001 says urgent again
+  PASS  TICK-5002 exists again
+  PASS  TICK-5002 content is intact
+  PASS  the bad digest.md is gone
+  PASS  no drift remains against the checkpoint
+
+====================================================================
+RECOVERED
+====================================================================
+
+==========================================================================
+DOCUMENT OUTPUT
+--------------------------------------------------------------------------
+The handover workbook is built, validated with the agent's own goal check, and re-opened to confirm it is a real .xlsx.
+==========================================================================
+
+====================================================================
+1. BUILD THE WORKBOOK
+====================================================================
+  wrote handover.xlsx (5,907 bytes)
+
+====================================================================
+2. VALIDATE WITH THE AGENT'S OWN GOAL CHECK
+====================================================================
+  check_workbook -> OK
+
+====================================================================
+3. RE-OPEN AND READ IT BACK
+====================================================================
+  sheets       ['Tickets', 'Summary']
+  dimensions   4 rows x 7 cols
+  header       ['ticket_id', 'urgency', 'topic', 'team', 'confidence', 'needs_human_review', 'summary']
+  row          ('TICK-5001', 'urgent', 'technical', 'engineering')
+  row          ('TICK-5002', 'high', 'billing', 'billing')
+  row          ('TICK-5003', 'high', 'account', 'trust_and_safety')
+  formulas     5 (e.g. =COUNTIF(Tickets!D:D,A2))
+
+====================================================================
+4. VERIFY
+====================================================================
+
+  PASS  the goal check accepts it
+  PASS  it opens as a real workbook
+  PASS  the header matches the agreed columns
+  PASS  one row per ticket
+  PASS  every ticket id is present
+  PASS  the flagged ticket is marked for review
+  PASS  counts are formulas, not typed totals
+  PASS  a summary sheet exists
+  PASS  a workbook without the Tickets sheet is rejected
+
+====================================================================
+WORKBOOK VALID  (D:\PracticeProjects\todo_app\agent\workspace\outbox\handover.xlsx)
+====================================================================
+
+Open it to confirm by eye:
+  start D:\PracticeProjects\todo_app\agent\workspace\outbox\handover.xlsx
+
+==========================================================================
+CUSTOM SKILL WORKFLOW
+--------------------------------------------------------------------------
+The shift-handover skill end to end: discovery, its documented command passing the permission policy while abuse variants are refused, the bundled script running, and the goal check accepting the result.
+==========================================================================
+
+
+======================================================================
+1. THE SKILL IS DISCOVERABLE
+======================================================================
+  skills\shift-handover\SKILL.md
+  loader sees skills: True
+
+======================================================================
+2. THE COMMAND SKILL.md TELLS THE AGENT TO RUN IS PERMITTED
+======================================================================
+  python D:\PracticeProjects\todo_app\agent\skills\shift-handover\scripts\build_handover.py D:\PracticeProjects\todo_app\agent\workspace\outbox\tickets.json D:\PracticeProjects\todo_app\agent\workspace\outbox\handover.xlsx
+  -> auto: python invocation confined to trusted paths
+  refused: output redirected outside the outbox -> deny
+  refused: a second command appended -> deny
+  refused: a different interpreter -> deny
+
+======================================================================
+3. STEP 2 OF THE SKILL: WRITE tickets.json
+======================================================================
+  wrote tickets.json (3 tickets)
+
+======================================================================
+4. STEP 3 OF THE SKILL: RUN THE BUNDLED SCRIPT
+======================================================================
+  exit 0
+  wrote handover.xlsx: 3 ticket(s), 1 urgent, 1 flagged for review
+
+======================================================================
+5. THE RESULT PASSES THE AGENT'S GOAL CHECK
+======================================================================
+  check_workbook -> OK
+  sheets: ['Tickets', 'Summary'], rows: 4
+  flagged for review: ['TICK-5003']
+
+======================================================================
+VERIFY
+======================================================================
+  PASS  the skill is on disk where the loader looks
+  PASS  the loader reports skills available
+  PASS  the documented command is allowed
+  PASS  refused: output redirected outside the outbox
+  PASS  refused: a second command appended
+  PASS  refused: a different interpreter
+  PASS  the bundled script succeeds
+  PASS  the workbook satisfies the goal check
+  PASS  the flagged ticket is carried through
+
+======================================================================
+SKILL WORKFLOW VALID
+======================================================================
+
+  open the workbook: start D:\PracticeProjects\todo_app\agent\workspace\outbox\handover.xlsx
+
+  Not covered here: whether the model reads the description and
+  chooses to invoke the skill. That needs an API key.
+
+==========================================================================
+RESULT
+==========================================================================
+
+All demonstrated segments passed.
+elapsed 4.2s
+
+Scope of this transcript: the agent loop was not run. The
+segments above exercise checkpointing, the document pipeline
+and the skill workflow without the model.
+
+transcript: D:\PracticeProjects\todo_app\docs\demo-run.txt
