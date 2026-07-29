@@ -46,7 +46,9 @@ Exit codes: `0` success, `1` agent/API failure, `2` no API key set.
 | [`checkpoints.py`](checkpoints.py) | Workspace snapshots and rollback |
 | [`demo_rollback.py`](demo_rollback.py) | Offline demonstration of recovering from a bad change |
 | [`demo_xlsx.py`](demo_xlsx.py) | Offline demonstration that the handover workbook opens and is correct |
-| [`skills/`](skills/README.md) | Where the pre-built xlsx skill is installed (not vendored) |
+| [`demo_skill.py`](demo_skill.py) | Offline demonstration of the custom skill's workflow |
+| [`skills/`](skills/shift-handover/SKILL.md) | Our own skills — committed |
+| [`vendor-skills/`](vendor-skills/README.md) | Third-party skills — installed locally, gitignored |
 | [`Dockerfile`](Dockerfile) / [`compose.yaml`](compose.yaml) | Container image and hardened run configuration |
 | [`HOSTING.md`](HOSTING.md) | How it is sandboxed and hosted, and what each layer prevents |
 | [`fs_policy.py`](fs_policy.py) | Filesystem roots and path containment checks |
@@ -73,6 +75,48 @@ source, so the agent cannot read or leak it.
 Full rationale, the layer-by-layer threat model, and the known gaps (no egress
 proxy, no `SessionStore`, image never built) are in [`HOSTING.md`](HOSTING.md).
 
+## The custom skill: `shift-handover`
+
+[`skills/shift-handover/`](skills/shift-handover/SKILL.md) is our own skill —
+version-controlled and committed, unlike the third-party ones.
+
+```
+skills/shift-handover/
+├── SKILL.md                      frontmatter + workflow
+├── scripts/build_handover.py     bundled builder (the supported way to make the workbook)
+└── reference/format.md           the exact layout, for verification
+```
+
+```powershell
+.\.venv\Scripts\python.exe demo_skill.py   # offline: walk the whole workflow
+.\.venv\Scripts\python.exe test_skill.py   # 38 checks
+```
+
+**The description is written to prevent over-triggering as much as to enable
+triggering.** It says when to use the skill (after every ticket in a batch is
+filed, to aggregate them), what it produces (`digest.md`, `handover.xlsx`), and
+explicitly when *not* to — not for classifying, not for a single ticket, not
+before the tickets exist. A description that only says what a skill does will
+get it invoked on everything vaguely adjacent.
+
+The bundled script exists so the agent doesn't re-invent spreadsheet code each
+run: column order, `COUNTIF` formulas, the frozen header, the autofilter, and
+the amber fill on rows needing review are fixed rather than improvised. It
+fails loudly — non-zero exit, a message naming the offending ticket and field,
+and **no half-written file** — so a failure tells the agent what to fix.
+
+### It forced a permission change
+
+The skill's script lives in `skills/shift-handover/scripts/`, not the outbox,
+so the step-9 Bash allowlist would have denied it. The rule is now: the
+*script* may come from a skill's `scripts/` directory (version-controlled code
+we ship, in a location the agent cannot write to), but **every other path
+argument must still be inside the outbox** — so a trusted script cannot be
+pointed at an untrusted destination. Six further checks in
+[`test_permissions.py`](test_permissions.py) cover that boundary, including
+traversal out of `scripts/` and a second `.py` argument being treated as an
+ordinary path rather than a second script.
+
 ## Document output (pre-built xlsx skill)
 
 The digest step produces a shift-handover workbook, `workspace/outbox/handover.xlsx`,
@@ -84,11 +128,15 @@ formulas rather than typed totals.
 .\.venv\Scripts\python.exe demo_xlsx.py   # offline: build, validate, read back
 ```
 
-The skill is **not vendored** — Anthropic's document skills are source-available,
-not open source, so installing them is a licensing decision left to you. See
-[`skills/README.md`](skills/README.md) for the one-line install. With
-`skills/` empty the agent still runs; the workbook simply is not part of the
-goal, gated by `loop.skills_available()`.
+The pre-built xlsx skill is **not vendored** — Anthropic's document skills are
+source-available, not open source, so installing them is a licensing decision
+left to you. See [`vendor-skills/README.md`](vendor-skills/README.md) for the
+one-line install; that directory is gitignored and excluded from the Docker
+build context, so source-available content can't be committed or baked into a
+published image by accident.
+
+It is not required: the custom `shift-handover` skill above builds the workbook
+on its own.
 
 Two things this forced, both deliberate:
 
@@ -311,12 +359,13 @@ drops every other built-in from its context.
 .\.venv\Scripts\python.exe test_loop.py         # 21 checks
 .\.venv\Scripts\python.exe test_fs_policy.py    # 25 checks
 .\.venv\Scripts\python.exe test_plan.py         # 27 checks
-.\.venv\Scripts\python.exe test_permissions.py  # 57 checks
+.\.venv\Scripts\python.exe test_permissions.py  # 63 checks
 .\.venv\Scripts\python.exe test_checkpoints.py  # 41 checks
-.\.venv\Scripts\python.exe test_hosting.py      # 36 checks
+.\.venv\Scripts\python.exe test_hosting.py      # 39 checks
+.\.venv\Scripts\python.exe test_skill.py        # 38 checks
 ```
 
-207 checks, no network and no API key. They cover the taxonomy validation, the
+254 checks, no network and no API key. They cover the taxonomy validation, the
 confidence gate, each context tool, the goal transitions, plan decomposition
 and sequencing, containment (traversal, absolute paths outside the repo, and a
 sibling directory whose name merely *starts with* `outbox`), and every row of

@@ -53,18 +53,30 @@ CONFIG_DIR = WORKSPACE / ".claude-config"
 # setting_sources=["project"], because that would also re-enable the repo's
 # CLAUDE.md and .claude/ — the leak closed in step 8. Plugins load skills from
 # an explicit directory without dragging the rest of the project settings in.
+# Two roots, deliberately separate: ours is version-controlled, theirs is
+# installed locally and gitignored because Anthropic's document skills are
+# source-available rather than open source.
 SKILLS_DIR = AGENT_DIR / "skills"
-ENABLED_SKILLS = ["xlsx"]
+VENDOR_SKILLS_DIR = AGENT_DIR / "vendor-skills"
+CUSTOM_SKILL = "shift-handover"
+ENABLED_SKILLS = [CUSTOM_SKILL, "xlsx"]
 
 
 def _skill_plugins() -> list[dict[str, str]]:
-    """The skills plugin, if the directory has been populated (see README)."""
-    if not SKILLS_DIR.is_dir() or not any(SKILLS_DIR.glob("*/SKILL.md")):
-        return []
-    return [{"type": "local", "path": str(SKILLS_DIR)}]
+    """Every populated skill root, as plugin paths."""
+    return [
+        {"type": "local", "path": str(root)}
+        for root in (SKILLS_DIR, VENDOR_SKILLS_DIR)
+        if root.is_dir() and any(root.glob("*/SKILL.md"))
+    ]
+
+
+def custom_skill_available() -> bool:
+    return (SKILLS_DIR / CUSTOM_SKILL / "SKILL.md").is_file()
 
 
 def skills_available() -> bool:
+    """Can a workbook be built? Either skill can do it."""
     return bool(_skill_plugins())
 OUTBOX_REL = OUTBOX.relative_to(REPO_ROOT).as_posix()
 DIGEST_NAME = "digest.md"
@@ -123,17 +135,14 @@ Every ticket from this batch has already been filed as a markdown file in
      - a "Needs attention first" section naming the highest-urgency tickets and
        anything flagged for human review, with one line each on why.
 
-  3. Build the handover workbook at {OUTBOX_REL}/{WORKBOOK_NAME} using the
-     xlsx skill. It needs a sheet named {WORKBOOK_SHEET!r} whose first row is
-     exactly these headers:
-       {', '.join(WORKBOOK_HEADERS)}
-     followed by one row per ticket. Add a second sheet with counts per team
-     and per urgency, using formulas (COUNTIF/COUNTIFS) rather than typing the
-     totals, so the figures recalculate if a row is edited.
+  3. Build the handover workbook at {OUTBOX_REL}/{WORKBOOK_NAME}. The
+     {CUSTOM_SKILL!r} skill covers this end to end — follow it rather than
+     writing spreadsheet code yourself; it bundles the builder script and the
+     exact format the next shift's filters depend on.
 
 Reference every ticket id exactly as it appears in the files. {OUTBOX_REL}/ is
-the only place you may write — including any helper script you run. Do not
-re-classify anything — the filed tickets are the source of truth.
+the only place you may write. Do not re-classify anything — the filed tickets
+are the source of truth.
 """
 
 

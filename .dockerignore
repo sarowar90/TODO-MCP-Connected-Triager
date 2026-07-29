@@ -17,6 +17,10 @@ agent/.venv/
 **/__pycache__/
 *.pyc
 
+# Third-party skills are source-available, not open source. Keep them out of
+# the build context so they cannot be baked into a published image.
+agent/vendor-skills/
+
 # Agent run state: snapshots, generated tickets, scratch.
 agent/workspace/outbox/
 agent/workspace/.checkpoints/

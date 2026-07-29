@@ -26,6 +26,12 @@ RUN useradd --create-home --uid 10001 --shell /usr/sbin/nologin agent
 
 COPY --chown=agent:agent agent/*.py /app/
 
+# Our own skills ship with the image. Third-party skills under vendor-skills/
+# deliberately do not: they are source-available, not open source, so baking
+# them into a published image would be redistribution. .dockerignore excludes
+# that directory; install it into the running container if you need it.
+COPY --chown=agent:agent agent/skills /app/skills
+
 # Copy only the spec the agent reads, not the repository. The agent has no
 # reason to see application source, and a container that cannot see it cannot
 # leak it — which also keeps the read root small and meaningful.

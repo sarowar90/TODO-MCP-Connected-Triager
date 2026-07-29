@@ -144,6 +144,14 @@ def main() -> int:
         "${ANTHROPIC_API_KEY" in compose and "sk-ant-" not in compose,
     )
 
+    print("\nskill packaging")
+    check("our own skills ship in the image", "agent/skills /app/skills" in dockerfile)
+    check(
+        "third-party skills are kept out of the build context",
+        "agent/vendor-skills/" in DOCKERIGNORE.read_text(encoding="utf-8"),
+        "source-available content must not be baked into a published image",
+    )
+
     print("\nbuild context hygiene")
     ignore = DOCKERIGNORE.read_text(encoding="utf-8")
     for name, needle in [
