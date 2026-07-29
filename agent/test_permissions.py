@@ -137,6 +137,54 @@ async def main() -> int:
         "not an allowed program" in classify("Bash", {"command": "ls"}).reason,
     )
 
+    print("\nbundled skill scripts (step 10)")
+    from permissions import SKILL_SCRIPT_ROOTS
+
+    bundled = SKILL_SCRIPT_ROOTS[0] / "shift-handover" / "scripts" / "build_handover.py"
+    tickets = OUTBOX / "tickets.json"
+    workbook = OUTBOX / "handover.xlsx"
+
+    check(
+        "a bundled skill script may be executed",
+        tier_of("Bash", {"command": f"python {bundled} {tickets} {workbook}"}) is Tier.AUTO,
+    )
+    check(
+        "but its output path must still be in the outbox",
+        tier_of("Bash", {"command": f"python {bundled} {tickets} /app/lib/evil.xlsx"})
+        is Tier.DENY,
+        "a trusted script must not be pointable at an untrusted destination",
+    )
+    check(
+        "a script elsewhere under the skill dir is not executable",
+        tier_of(
+            "Bash",
+            {"command": f"python {SKILL_SCRIPT_ROOTS[0] / 'shift-handover' / 'SKILL.md.py'}"},
+        )
+        is Tier.DENY,
+        "only files directly inside a scripts/ directory count",
+    )
+    check(
+        "a script outside both the skill roots and the outbox is denied",
+        tier_of("Bash", {"command": "python /tmp/payload.py"}) is Tier.DENY,
+    )
+    check(
+        "traversal out of a scripts/ directory is denied",
+        tier_of(
+            "Bash",
+            {"command": f"python {SKILL_SCRIPT_ROOTS[0] / 'x' / 'scripts' / '..' / '..' / '..' / 'agent.py'}"},
+        )
+        is Tier.DENY,
+    )
+    check(
+        "only the first .py argument is treated as the script",
+        tier_of(
+            "Bash",
+            {"command": f"python {bundled} {SKILL_SCRIPT_ROOTS[0] / 'y' / 'scripts' / 'other.py'}"},
+        )
+        is Tier.DENY,
+        "a second bundled path must still be checked as an ordinary argument",
+    )
+
     print("\ndenied actions")
     check("web fetch", tier_of("WebFetch", {"url": "https://example.com"}) is Tier.DENY)
     check("web search", tier_of("WebSearch", {"query": "x"}) is Tier.DENY)

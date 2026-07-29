@@ -51,12 +51,17 @@ import os
 import shlex
 from dataclasses import dataclass
 from enum import Enum
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Any, Protocol
 
 from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
 
-from fs_policy import READ_TOOLS, WRITE_TOOLS, check_access, target_path
+from fs_policy import AGENT_DIR, READ_TOOLS, WRITE_TOOLS, check_access, target_path
+
+# Skill directories whose bundled scripts/ may be executed. These are read-only
+# to the agent — nothing in the policy lets it write here — so a script found
+# in one is code we shipped, not code the agent authored.
+SKILL_SCRIPT_ROOTS = (AGENT_DIR / "skills", AGENT_DIR / "vendor-skills")
 
 CREATE_TICKET = "mcp__triage__create_ticket"
 
@@ -188,24 +193,53 @@ def _classify_bash(command: str) -> Decision:
             f"{'/'.join(BASH_ALLOWED_PROGRAMS)} may be run",
         )
 
-    # Any argument that looks like a path must live inside the outbox. `-c`
-    # inline scripts are rejected outright: their contents are not inspectable
-    # as paths, so they could write anywhere the process can reach.
+    # Path arguments are split two ways. The *script* may also come from a
+    # skill's bundled scripts/ directory — that is version-controlled code we
+    # ship, sitting in a location the agent cannot write to, so running it is
+    # no more privileged than running a script it wrote in the outbox. Every
+    # other path argument must still be inside the outbox, so a trusted script
+    # cannot be pointed at an untrusted destination.
+    #
+    # `-c` inline scripts are rejected outright: their contents are not
+    # inspectable as paths, so they could write anywhere the process can reach.
+    seen_script = False
     for arg in parts[1:]:
         if arg == "-c":
             return Decision(
                 Tier.DENY,
-                "inline `python -c` is not permitted; the skill must run a "
-                "script file inside the outbox",
+                "inline `python -c` is not permitted; run a script file from a "
+                "skill's scripts/ directory or from the outbox",
             )
         if arg.startswith("-"):
             continue
-        if "/" in arg or "\\" in arg or arg.endswith((".py", ".xlsx", ".csv")):
-            ok, reason = check_access("Write", {"file_path": arg})
-            if not ok:
-                return Decision(Tier.DENY, f"bash argument {arg!r}: {reason}")
+        if not ("/" in arg or "\\" in arg or arg.endswith((".py", ".xlsx", ".csv", ".json"))):
+            continue
 
-    return Decision(Tier.AUTO, "python invocation confined to the outbox")
+        is_script = arg.endswith(".py") and not seen_script
+        if is_script:
+            seen_script = True
+            if _is_bundled_script(arg):
+                continue
+        ok, reason = check_access("Write", {"file_path": arg})
+        if not ok:
+            return Decision(Tier.DENY, f"bash argument {arg!r}: {reason}")
+
+    return Decision(Tier.AUTO, "python invocation confined to trusted paths")
+
+
+def _is_bundled_script(arg: str) -> bool:
+    """Is this a script shipped inside a skill's scripts/ directory?"""
+    try:
+        resolved = Path(arg).expanduser().resolve()
+    except (OSError, ValueError):
+        return False
+    for root in SKILL_SCRIPT_ROOTS:
+        try:
+            if resolved.is_relative_to(root.resolve()) and resolved.parent.name == "scripts":
+                return True
+        except (OSError, ValueError):
+            continue
+    return False
 
 
 def _classify_ticket(args: dict[str, Any]) -> Decision:
